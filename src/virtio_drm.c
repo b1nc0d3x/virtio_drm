@@ -101,6 +101,10 @@ struct vtgpu_softc {
 
 	struct vtgpu_scanout	 vtgpu_scanouts[VIRTIO_GPU_MAX_SCANOUTS];
 	uint32_t		 vtgpu_primary_scanout;
+
+	/* Resource lifecycle bookkeeping for clean detach(). */
+	bool			 vtgpu_have_resource;
+	bool			 vtgpu_have_backing;
 };
 
 static int	vtgpu_modevent(module_t, int, void *);
@@ -118,6 +122,8 @@ static int	vtgpu_get_display_info(struct vtgpu_softc *);
 static int	vtgpu_get_edid(struct vtgpu_softc *, uint32_t);
 static int	vtgpu_create_2d(struct vtgpu_softc *);
 static int	vtgpu_attach_backing(struct vtgpu_softc *);
+static int	vtgpu_detach_backing(struct vtgpu_softc *);
+static int	vtgpu_resource_unref(struct vtgpu_softc *);
 static int	vtgpu_set_scanout(struct vtgpu_softc *, uint32_t, uint32_t,
 		    uint32_t, uint32_t);
 static int	vtgpu_transfer_to_host_2d(struct vtgpu_softc *, uint32_t,
@@ -377,12 +383,14 @@ vtgpu_attach(device_t dev)
 	if (error != 0) {
 		goto fail;
 	}
+	sc->vtgpu_have_resource = true;
 
 	/* Attach the backing memory */
 	error = vtgpu_attach_backing(sc);
 	if (error != 0) {
 		goto fail;
 	}
+	sc->vtgpu_have_backing = true;
 
 	/* Set the scanout to link the framebuffer to the display scanout */
 	error = vtgpu_set_scanout(sc, 0, 0, sc->vtgpu_fb_info.fb_width,
@@ -416,13 +424,31 @@ vtgpu_detach(device_t dev)
 	sc = device_get_softc(dev);
 	if (sc->vtgpu_have_fb_info)
 		vt_deallocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
+
+	/*
+	 * Tear down the host-side resource state before freeing the
+	 * guest memory that backs it.  Order matters:
+	 *   1. DETACH_BACKING: host stops referencing our pages.
+	 *   2. RESOURCE_UNREF: host drops the resource record.
+	 *   3. Free the backing pages.
+	 * Doing it in the other order leaves the host with dangling
+	 * sglist entries pointing at memory the guest has already
+	 * returned to the allocator.
+	 */
+	if (sc->vtgpu_have_backing) {
+		(void)vtgpu_detach_backing(sc);
+		sc->vtgpu_have_backing = false;
+	}
+	if (sc->vtgpu_have_resource) {
+		(void)vtgpu_resource_unref(sc);
+		sc->vtgpu_have_resource = false;
+	}
+
 	if (sc->vtgpu_fb_info.fb_vbase != 0) {
 		MPASS(sc->vtgpu_fb_info.fb_size != 0);
 		free((void *)sc->vtgpu_fb_info.fb_vbase,
 		    M_DEVBUF);
 	}
-
-	/* TODO: Tell the host we are detaching */
 
 	return (0);
 }
@@ -707,6 +733,66 @@ vtgpu_attach_backing(struct vtgpu_softc *sc)
 		return (EINVAL);
 	}
 
+	return (0);
+}
+
+static int
+vtgpu_detach_backing(struct vtgpu_softc *sc)
+{
+	struct {
+		struct virtio_gpu_resource_detach_backing req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.resource_id = htole32(VTGPU_RESOURCE_ID);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA)) {
+		device_printf(sc->vtgpu_dev,
+		    "RESOURCE_DETACH_BACKING bad response 0x%x\n",
+		    le32toh(s.resp.type));
+		return (EINVAL);
+	}
+	return (0);
+}
+
+static int
+vtgpu_resource_unref(struct vtgpu_softc *sc)
+{
+	struct {
+		struct virtio_gpu_resource_unref req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_UNREF);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.resource_id = htole32(VTGPU_RESOURCE_ID);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA)) {
+		device_printf(sc->vtgpu_dev,
+		    "RESOURCE_UNREF bad response 0x%x\n",
+		    le32toh(s.resp.type));
+		return (EINVAL);
+	}
 	return (0);
 }
 
