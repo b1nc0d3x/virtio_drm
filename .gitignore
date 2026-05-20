@@ -1,0 +1,15 @@
+*.o
+*.ko
+*.kld
+*.d
+.depend*
+opt_*.h
+bus_if.h
+device_if.h
+virtio_bus_if.h
+virtio_if.h
+fb_if.h
+export_syms
+setdef*
+machine
+x86
