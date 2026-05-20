@@ -67,6 +67,22 @@
 /* The guest can allocate resource IDs, we only need one */
 #define	VTGPU_RESOURCE_ID	1
 
+/*
+ * Per-scanout state.  Phase 1 enumerates all scanouts reported
+ * by VIRTIO_GPU_CMD_GET_DISPLAY_INFO so multi-monitor configs
+ * are visible at boot; the framebuffer itself still drives only
+ * the primary (vd_scanout) scanout until DRM-KMS lands in Phase
+ * 3.
+ */
+struct vtgpu_scanout {
+	uint32_t	x;
+	uint32_t	y;
+	uint32_t	width;
+	uint32_t	height;
+	uint32_t	flags;
+	bool		enabled;
+};
+
 struct vtgpu_softc {
 	/* Must be first so we can cast from info -> softc */
 	struct fb_info 		 vtgpu_fb_info;
@@ -80,6 +96,9 @@ struct vtgpu_softc {
 	uint64_t		 vtgpu_next_fence;
 
 	bool			 vtgpu_have_fb_info;
+
+	struct vtgpu_scanout	 vtgpu_scanouts[VIRTIO_GPU_MAX_SCANOUTS];
+	uint32_t		 vtgpu_primary_scanout;
 };
 
 static int	vtgpu_modevent(module_t, int, void *);
@@ -504,27 +523,47 @@ vtgpu_get_display_info(struct vtgpu_softc *sc)
 	if (error != 0)
 		return (error);
 
-	for (int i = 0; i < sc->vtgpu_gpucfg.num_scanouts; i++) {
-		if (s.resp.pmodes[i].enabled != 0)
-			MPASS(i == 0);
-			sc->vtgpu_fb_info.fb_name =
-			    device_get_nameunit(sc->vtgpu_dev);
+	uint32_t nscanouts = sc->vtgpu_gpucfg.num_scanouts;
+	if (nscanouts > VIRTIO_GPU_MAX_SCANOUTS)
+		nscanouts = VIRTIO_GPU_MAX_SCANOUTS;
 
-			sc->vtgpu_fb_info.fb_width =
-			    le32toh(s.resp.pmodes[i].r.width);
-			sc->vtgpu_fb_info.fb_height =
-			    le32toh(s.resp.pmodes[i].r.height);
-			/* 32 bits per pixel */
-			sc->vtgpu_fb_info.fb_bpp = 32;
-			sc->vtgpu_fb_info.fb_depth = 32;
-			sc->vtgpu_fb_info.fb_size = sc->vtgpu_fb_info.fb_width *
-			    sc->vtgpu_fb_info.fb_height * 4;
-			sc->vtgpu_fb_info.fb_stride =
-			    sc->vtgpu_fb_info.fb_width * 4;
-			return (0);
+	int primary = -1;
+	for (uint32_t i = 0; i < nscanouts; i++) {
+		struct vtgpu_scanout *so = &sc->vtgpu_scanouts[i];
+		so->enabled = (s.resp.pmodes[i].enabled != 0);
+		so->x = le32toh(s.resp.pmodes[i].r.x);
+		so->y = le32toh(s.resp.pmodes[i].r.y);
+		so->width = le32toh(s.resp.pmodes[i].r.width);
+		so->height = le32toh(s.resp.pmodes[i].r.height);
+		so->flags = le32toh(s.resp.pmodes[i].flags);
+		if (so->enabled) {
+			device_printf(sc->vtgpu_dev,
+			    "scanout %u: %ux%u+%u+%u flags=0x%x\n",
+			    i, so->width, so->height, so->x, so->y,
+			    so->flags);
+			if (primary < 0)
+				primary = (int)i;
+		}
 	}
 
-	return (ENXIO);
+	if (primary < 0) {
+		device_printf(sc->vtgpu_dev,
+		    "no enabled scanout reported by host\n");
+		return (ENXIO);
+	}
+
+	sc->vtgpu_primary_scanout = (uint32_t)primary;
+
+	struct vtgpu_scanout *so = &sc->vtgpu_scanouts[primary];
+	sc->vtgpu_fb_info.fb_name = device_get_nameunit(sc->vtgpu_dev);
+	sc->vtgpu_fb_info.fb_width = so->width;
+	sc->vtgpu_fb_info.fb_height = so->height;
+	/* 32 bits per pixel */
+	sc->vtgpu_fb_info.fb_bpp = 32;
+	sc->vtgpu_fb_info.fb_depth = 32;
+	sc->vtgpu_fb_info.fb_size = so->width * so->height * 4;
+	sc->vtgpu_fb_info.fb_stride = so->width * 4;
+	return (0);
 }
 
 static int
