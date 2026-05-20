@@ -62,7 +62,7 @@
 
 #include "fb_if.h"
 
-#define VTGPU_FEATURES	0
+#define VTGPU_FEATURES	(1ULL << VIRTIO_GPU_F_EDID)
 
 /* The guest can allocate resource IDs, we only need one */
 #define	VTGPU_RESOURCE_ID	1
@@ -81,6 +81,8 @@ struct vtgpu_scanout {
 	uint32_t	height;
 	uint32_t	flags;
 	bool		enabled;
+	uint32_t	edid_size;	/* 0 if no EDID for this scanout */
+	uint8_t		edid[1024];
 };
 
 struct vtgpu_softc {
@@ -113,6 +115,7 @@ static void	vtgpu_read_config(struct vtgpu_softc *,
 		    struct virtio_gpu_config *);
 static int	vtgpu_alloc_virtqueue(struct vtgpu_softc *);
 static int	vtgpu_get_display_info(struct vtgpu_softc *);
+static int	vtgpu_get_edid(struct vtgpu_softc *, uint32_t);
 static int	vtgpu_create_2d(struct vtgpu_softc *);
 static int	vtgpu_attach_backing(struct vtgpu_softc *);
 static int	vtgpu_set_scanout(struct vtgpu_softc *, uint32_t, uint32_t,
@@ -343,6 +346,25 @@ vtgpu_attach(device_t dev)
 	}
 
 	/*
+	 * Best-effort EDID fetch for every enabled scanout.  Errors
+	 * here are non-fatal: hosts that don't have an EDID for a
+	 * given scanout reply INVALID_PARAMETER, and the scanout
+	 * still works without one.
+	 */
+	if (sc->vtgpu_features & (1ULL << VIRTIO_GPU_F_EDID)) {
+		for (uint32_t i = 0; i < sc->vtgpu_gpucfg.num_scanouts &&
+		    i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
+			if (!sc->vtgpu_scanouts[i].enabled)
+				continue;
+			if (vtgpu_get_edid(sc, i) == 0) {
+				device_printf(dev,
+				    "scanout %u: EDID %u bytes\n",
+				    i, sc->vtgpu_scanouts[i].edid_size);
+			}
+		}
+	}
+
+	/*
 	 * TODO: This doesn't need to be contigmalloc as we
 	 * can use scatter-gather lists.
 	 */
@@ -563,6 +585,55 @@ vtgpu_get_display_info(struct vtgpu_softc *sc)
 	sc->vtgpu_fb_info.fb_depth = 32;
 	sc->vtgpu_fb_info.fb_size = so->width * so->height * 4;
 	sc->vtgpu_fb_info.fb_stride = so->width * 4;
+	return (0);
+}
+
+static int
+vtgpu_get_edid(struct vtgpu_softc *sc, uint32_t scanout)
+{
+	struct {
+		struct virtio_gpu_cmd_get_edid req;
+		char pad;
+		struct virtio_gpu_resp_edid resp;
+	} s = { 0 };
+	int error;
+	uint32_t size;
+	struct vtgpu_scanout *so;
+
+	if (scanout >= VIRTIO_GPU_MAX_SCANOUTS)
+		return (EINVAL);
+	if ((sc->vtgpu_features & (1ULL << VIRTIO_GPU_F_EDID)) == 0)
+		return (ENOTSUP);
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_GET_EDID);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.scanout = htole32(scanout);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+
+	if (s.resp.hdr.type != htole32(VIRTIO_GPU_RESP_OK_EDID)) {
+		/*
+		 * Hosts that don't have an EDID for the scanout reply
+		 * VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER; that is not a
+		 * hard error — the scanout still works, it just has
+		 * no EDID to report.
+		 */
+		return (ENOENT);
+	}
+
+	size = le32toh(s.resp.size);
+	if (size > sizeof(s.resp.edid))
+		size = sizeof(s.resp.edid);
+
+	so = &sc->vtgpu_scanouts[scanout];
+	so->edid_size = size;
+	memcpy(so->edid, s.resp.edid, size);
+
 	return (0);
 }
 
