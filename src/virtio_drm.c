@@ -61,6 +61,7 @@
 #include <dev/vt/colors/vt_termcolors.h>
 
 #include "fb_if.h"
+#include "virtio_if.h"
 
 #define VTGPU_FEATURES	(1ULL << VIRTIO_GPU_F_EDID)
 
@@ -112,6 +113,7 @@ static int	vtgpu_modevent(module_t, int, void *);
 static int	vtgpu_probe(device_t);
 static int	vtgpu_attach(device_t);
 static int	vtgpu_detach(device_t);
+static int	vtgpu_config_change(device_t);
 
 static int	vtgpu_negotiate_features(struct vtgpu_softc *);
 static int	vtgpu_setup_features(struct vtgpu_softc *);
@@ -274,6 +276,9 @@ static device_method_t vtgpu_methods[] = {
 	DEVMETHOD(device_probe,		vtgpu_probe),
 	DEVMETHOD(device_attach,	vtgpu_attach),
 	DEVMETHOD(device_detach,	vtgpu_detach),
+
+	/* VirtIO methods. */
+	DEVMETHOD(virtio_config_change,	vtgpu_config_change),
 
 	DEVMETHOD_END
 };
@@ -450,6 +455,63 @@ vtgpu_detach(device_t dev)
 		    M_DEVBUF);
 	}
 
+	return (0);
+}
+
+/*
+ * Called by the virtio framework when the device asserts a
+ * config-change interrupt.  For virtio-gpu the only event
+ * defined today is VIRTIO_GPU_EVENT_DISPLAY (scanout topology
+ * changed): the spec wants us to re-fetch display_info, then
+ * write the bits we observed back into events_clear so the host
+ * knows we noticed.
+ *
+ * Dynamic fb resize is intentionally NOT done here — vt(4) is
+ * a fixed-size console framebuffer, and resizing it under the
+ * vt locking model is fragile.  EDID-driven mode changes for
+ * userland (X11 / DRM clients) land in Phase 3 along with the
+ * DRM-KMS frontend.  For now we just keep the cached
+ * display_info + EDID up to date and log the change, which is
+ * already useful for diagnosing hotplug.
+ */
+static int
+vtgpu_config_change(device_t dev)
+{
+	struct vtgpu_softc *sc;
+	uint32_t events;
+	uint32_t cleared;
+
+	sc = device_get_softc(dev);
+
+	vtgpu_read_config(sc, &sc->vtgpu_gpucfg);
+	events = sc->vtgpu_gpucfg.events_read;
+	if (events == 0)
+		return (0);
+
+	device_printf(dev, "config change: events_read=0x%08x\n", events);
+
+	cleared = 0;
+	if (events & VIRTIO_GPU_EVENT_DISPLAY) {
+		if (vtgpu_get_display_info(sc) == 0) {
+			if (sc->vtgpu_features &
+			    (1ULL << VIRTIO_GPU_F_EDID)) {
+				for (uint32_t i = 0;
+				    i < sc->vtgpu_gpucfg.num_scanouts &&
+				    i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
+					sc->vtgpu_scanouts[i].edid_size = 0;
+					if (sc->vtgpu_scanouts[i].enabled)
+						(void)vtgpu_get_edid(sc, i);
+				}
+			}
+		}
+		cleared |= VIRTIO_GPU_EVENT_DISPLAY;
+	}
+
+	if (cleared != 0) {
+		virtio_write_device_config(dev,
+		    offsetof(struct virtio_gpu_config, events_clear),
+		    &cleared, sizeof(cleared));
+	}
 	return (0);
 }
 
