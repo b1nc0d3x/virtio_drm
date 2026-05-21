@@ -167,28 +167,22 @@ our CRTC will honor it (within the fb-from-attach limitation above).
 
 ---
 
-## 3.F — primary plane  (pending)
+## 3.F — primary plane  *(NOT APPLICABLE — drm2)*
 
-**Problem solved:** the plane is the binding between a
-`drm_framebuffer` (userland-owned) and the CRTC.  Without a plane,
-even a connector + CRTC combo gives userland no way to *attach its own
-buffer* to the scanout — every modeset just reuses the kernel-allocated
-attach-time fb.  A plane is what makes "render here, scan that out"
-work.
+**Problem solved:** *(nothing — this sub-phase doesn't exist in the
+drm2 model.)*
 
-**What:**
-- One `drm_plane` of `DRM_PLANE_TYPE_PRIMARY` bound to the single
-  CRTC.
-- `drm_plane_init` with format list `DRM_FORMAT_XRGB8888` (matches
-  our existing `VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM`).
-- `update_plane()` callback that *would* swap the scanout source if a
-  userland framebuffer were bound — for now just calls
-  `mode_set_base`.
+**Why:**  Universal planes — and `DRM_PLANE_TYPE_PRIMARY` — were
+introduced in the atomic-modesetting branch of mainline DRM, *after*
+the drm2 fork that ships in FreeBSD base.  In drm2 the primary plane
+is **implicit in the CRTC**: the CRTC's `mode_set` + `mode_set_base`
+callbacks (which we wired in 3.D) own the primary scanout source
+directly.  `drm_plane_init` in drm2 is reserved for *overlay* planes,
+which we don't need.
 
-**State after 3.F:** framework recognizes a plane; `drmModeAddFB2`
-from userland still fails (`fb_create` returns `-ENOSYS`), so the plane
-never actually receives a userland fb.  The pipe is now waiting on
-3.G to deliver the water.
+This means 3.F is a **no-op** for our driver — there's no commit and
+no code, just this note.  Phase 3.G (dumb buffers) is what actually
+delivers "userland can bind its own framebuffer to the CRTC."
 
 ---
 
