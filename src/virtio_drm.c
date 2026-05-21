@@ -139,6 +139,7 @@ struct vtgpu_softc {
 	uint64_t		 vtgpu_features;
 
 	struct virtqueue	*vtgpu_ctrl_vq;
+	struct virtqueue	*vtgpu_cursor_vq;	/* Phase 2: vq #1 */
 
 	uint64_t		 vtgpu_next_fence;
 
@@ -150,7 +151,23 @@ struct vtgpu_softc {
 	/* Resource lifecycle bookkeeping for clean detach(). */
 	bool			 vtgpu_have_resource;
 	bool			 vtgpu_have_backing;
+
+	/* Phase 2: hardware cursor resource. */
+	vm_offset_t		 vtgpu_cursor_vbase;
+	bus_addr_t		 vtgpu_cursor_pbase;
+	bool			 vtgpu_have_cursor_resource;
+	bool			 vtgpu_have_cursor_backing;
+	uint32_t		 vtgpu_cursor_x;
+	uint32_t		 vtgpu_cursor_y;
 };
+
+#define	VTGPU_CURSOR_RESOURCE_ID	2
+#define	VTGPU_CURSOR_WIDTH		64
+#define	VTGPU_CURSOR_HEIGHT		64
+#define	VTGPU_CURSOR_BPP		4
+#define	VTGPU_CURSOR_SIZE		(VTGPU_CURSOR_WIDTH * \
+					 VTGPU_CURSOR_HEIGHT * \
+					 VTGPU_CURSOR_BPP)
 
 static int	vtgpu_modevent(module_t, int, void *);
 
@@ -623,6 +640,7 @@ vtgpu_read_config(struct vtgpu_softc *sc,
 #undef VTGPU_GET_CONFIG
 }
 
+/* Allocate the control vq (#0) and the cursor vq (#1). */
 static int
 vtgpu_alloc_virtqueue(struct vtgpu_softc *sc)
 {
@@ -631,10 +649,12 @@ vtgpu_alloc_virtqueue(struct vtgpu_softc *sc)
 	int nvqs;
 
 	dev = sc->vtgpu_dev;
-	nvqs = 1;
+	nvqs = 2;
 
 	VQ_ALLOC_INFO_INIT(&vq_info[0], 0, NULL, sc, &sc->vtgpu_ctrl_vq,
 	    "%s control", device_get_nameunit(dev));
+	VQ_ALLOC_INFO_INIT(&vq_info[1], 0, NULL, sc, &sc->vtgpu_cursor_vq,
+	    "%s cursor", device_get_nameunit(dev));
 
 	return (virtio_alloc_virtqueues(dev, nvqs, vq_info));
 }
@@ -671,6 +691,39 @@ vtgpu_req_resp(struct vtgpu_softc *sc, void *req, size_t reqlen,
 	virtqueue_notify(sc->vtgpu_ctrl_vq);
 	virtqueue_poll(sc->vtgpu_ctrl_vq, NULL);
 
+	return (0);
+}
+
+/*
+ * Send an UPDATE_CURSOR / MOVE_CURSOR over the cursor vq.  The spec
+ * says the cursor vq is *write-only* — the host does not produce a
+ * response — so we don't sglist-append a response buffer.  We still
+ * poll for completion to keep the queue from accumulating descriptors,
+ * but we expect zero return data.
+ */
+static int
+vtgpu_cursor_post(struct vtgpu_softc *sc, struct virtio_gpu_update_cursor *cmd)
+{
+	struct sglist sg;
+	struct sglist_seg segs[1];
+	int error;
+
+	sglist_init(&sg, 1, segs);
+	error = sglist_append(&sg, cmd, sizeof(*cmd));
+	if (error != 0) {
+		device_printf(sc->vtgpu_dev,
+		    "cursor: unable to append req to sglist: %d\n", error);
+		return (error);
+	}
+
+	error = virtqueue_enqueue(sc->vtgpu_cursor_vq, cmd, &sg, 1, 0);
+	if (error != 0) {
+		device_printf(sc->vtgpu_dev, "cursor: enqueue failed: %d\n",
+		    error);
+		return (error);
+	}
+	virtqueue_notify(sc->vtgpu_cursor_vq);
+	virtqueue_poll(sc->vtgpu_cursor_vq, NULL);
 	return (0);
 }
 
