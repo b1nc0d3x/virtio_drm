@@ -88,6 +88,7 @@
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/sglist.h>
+#include <sys/sysctl.h>
 
 #include <machine/atomic.h>
 #include <machine/bus.h>
@@ -204,6 +205,7 @@ static int	vtgpu_update_cursor(struct vtgpu_softc *, uint32_t, uint32_t,
 		    uint32_t, uint32_t, uint32_t);
 static int	vtgpu_move_cursor(struct vtgpu_softc *, uint32_t, uint32_t,
 		    uint32_t);
+static void	vtgpu_sysctl_setup(struct vtgpu_softc *);
 
 static vd_blank_t		vtgpu_fb_blank;
 static vd_bitblt_text_t		vtgpu_fb_bitblt_text;
@@ -520,6 +522,12 @@ vtgpu_attach(device_t dev)
 				sc->vtgpu_have_cursor_backing = true;
 		}
 	}
+	if (sc->vtgpu_have_cursor_backing)
+		device_printf(dev, "cursor: 64x64 BGRA resource ready\n");
+
+	/* Phase 2.D test surface — dev.vgpu.<unit>.cursor_xy / _test_pattern. */
+	vtgpu_sysctl_setup(sc);
+
 	error = 0;
 
 fail:
@@ -1238,6 +1246,79 @@ vtgpu_move_cursor(struct vtgpu_softc *sc, uint32_t scanout,
 	sc->vtgpu_cursor_x = x;
 	sc->vtgpu_cursor_y = y;
 	return (vtgpu_cursor_post(sc, &cmd));
+}
+
+/* `dev.vgpu.0.cursor_xy="X Y"` → MOVE_CURSOR. */
+static int
+vtgpu_sysctl_cursor_xy(SYSCTL_HANDLER_ARGS)
+{
+	struct vtgpu_softc *sc = arg1;
+	char buf[32];
+	uint32_t x, y;
+	int error;
+
+	snprintf(buf, sizeof(buf), "%u %u", sc->vtgpu_cursor_x,
+	    sc->vtgpu_cursor_y);
+	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (sscanf(buf, "%u %u", &x, &y) != 2 &&
+	    sscanf(buf, "%u,%u", &x, &y) != 2)
+		return (EINVAL);
+	return (vtgpu_move_cursor(sc, sc->vtgpu_primary_scanout, x, y));
+}
+
+/*
+ * `dev.vgpu.0.cursor_test_pattern=1` → paint an opaque-square
+ * test bitmap into the cursor buffer and send UPDATE_CURSOR.
+ * Useful to confirm end-to-end cursor visibility without DRM.
+ */
+static int
+vtgpu_sysctl_cursor_test(SYSCTL_HANDLER_ARGS)
+{
+	struct vtgpu_softc *sc = arg1;
+	int val = 0;
+	int error;
+	uint32_t *px;
+	uint32_t i;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val == 0 || !sc->vtgpu_have_cursor_backing)
+		return (0);
+
+	/* Solid magenta square with a transparent 1-pixel border. */
+	px = (uint32_t *)sc->vtgpu_cursor_vbase;
+	for (i = 0; i < VTGPU_CURSOR_WIDTH * VTGPU_CURSOR_HEIGHT; i++) {
+		uint32_t r = i / VTGPU_CURSOR_WIDTH;
+		uint32_t c = i % VTGPU_CURSOR_WIDTH;
+		if (r == 0 || c == 0 || r == VTGPU_CURSOR_HEIGHT - 1 ||
+		    c == VTGPU_CURSOR_WIDTH - 1)
+			px[i] = 0x00000000;	/* transparent border */
+		else
+			px[i] = 0xffff00ff;	/* BGRA: opaque magenta */
+	}
+	return (vtgpu_update_cursor(sc, sc->vtgpu_primary_scanout,
+	    sc->vtgpu_cursor_x, sc->vtgpu_cursor_y, 0, 0));
+}
+
+/* Register the cursor sysctls under the device's auto-created tree. */
+static void
+vtgpu_sysctl_setup(struct vtgpu_softc *sc)
+{
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *oid;
+
+	ctx = device_get_sysctl_ctx(sc->vtgpu_dev);
+	oid = device_get_sysctl_tree(sc->vtgpu_dev);
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO, "cursor_xy",
+	    CTLTYPE_STRING | CTLFLAG_RW, sc, 0, vtgpu_sysctl_cursor_xy, "A",
+	    "Cursor X Y position; write to issue MOVE_CURSOR");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
+	    "cursor_test_pattern", CTLTYPE_INT | CTLFLAG_WR, sc, 0,
+	    vtgpu_sysctl_cursor_test, "I",
+	    "Write 1 to install a magenta test bitmap + UPDATE_CURSOR");
 }
 
 static int
