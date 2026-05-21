@@ -174,6 +174,7 @@ struct vtgpu_softc {
 
 	/* Phase 3: DRM-KMS frontend on the in-base drm2 stack. */
 	struct drm_device	*vtgpu_drm_dev;
+	struct drm_crtc		 vtgpu_drm_crtc;	/* one CRTC per device */
 };
 
 #define	VTGPU_CURSOR_RESOURCE_ID	2
@@ -196,6 +197,8 @@ static int	vtgpu_setup_features(struct vtgpu_softc *);
 static void	vtgpu_read_config(struct vtgpu_softc *,
 		    struct virtio_gpu_config *);
 static int	vtgpu_alloc_virtqueue(struct vtgpu_softc *);
+static int	vtgpu_req_resp(struct vtgpu_softc *, void *, size_t,
+		    void *, size_t);
 static int	vtgpu_get_display_info(struct vtgpu_softc *);
 static int	vtgpu_get_edid(struct vtgpu_softc *, uint32_t);
 static int	vtgpu_create_2d(struct vtgpu_softc *);
@@ -442,6 +445,144 @@ static const struct drm_mode_config_funcs virtio_drm_mode_config_funcs = {
 };
 
 /*
+ * Phase 3.D — CRTC.
+ *
+ * One CRTC per virtio_drm device.  Maps the DRM mode-setting concept
+ * onto our existing virtio-gpu commands:
+ *
+ *   - dpms        : VIRTIO_GPU_CMD_SET_SCANOUT with resource_id=0 to
+ *                   blank, or with our framebuffer resource to enable.
+ *   - mode_set    : SET_SCANOUT to point the host's scanout at our
+ *                   primary fb resource using the new mode dimensions.
+ *   - prepare/commit: brackets around mode_set; we have nothing to
+ *                     latch atomically so they're no-ops.
+ *   - mode_set_base: same as mode_set but only updates origin/fb,
+ *                    not timing.
+ *
+ * Phase 3.E adds the connector that drives mode discovery; until
+ * then this CRTC is dormant from userland's perspective.
+ */
+
+static void
+virtio_drm_crtc_dpms(struct drm_crtc *crtc, int mode)
+{
+	struct vtgpu_softc *sc;
+	uint32_t scanout;
+
+	sc = device_get_softc(crtc->dev->dev);
+	scanout = sc->vtgpu_primary_scanout;
+
+	if (mode == DRM_MODE_DPMS_ON) {
+		(void)vtgpu_set_scanout(sc, 0, 0,
+		    sc->vtgpu_fb_info.fb_width,
+		    sc->vtgpu_fb_info.fb_height);
+	} else {
+		/* Blank: point scanout at resource_id 0 to detach. */
+		struct {
+			struct virtio_gpu_set_scanout req;
+			char pad;
+			struct virtio_gpu_ctrl_hdr resp;
+		} s = { 0 };
+		s.req.hdr.type = htole32(VIRTIO_GPU_CMD_SET_SCANOUT);
+		s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+		s.req.hdr.fence_id = htole64(
+		    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+		s.req.scanout_id = htole32(scanout);
+		s.req.resource_id = htole32(0);
+		(void)vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+		    sizeof(s.resp));
+	}
+}
+
+static bool
+virtio_drm_crtc_mode_fixup(struct drm_crtc *crtc,
+    const struct drm_display_mode *mode, struct drm_display_mode *adj)
+{
+	(void)crtc;
+	(void)mode;
+	(void)adj;
+	return (true);
+}
+
+static int
+virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
+    struct drm_display_mode *adj, int x, int y,
+    struct drm_framebuffer *old_fb)
+{
+	struct vtgpu_softc *sc;
+	int error;
+
+	(void)adj;
+	(void)x;
+	(void)y;
+	(void)old_fb;
+
+	sc = device_get_softc(crtc->dev->dev);
+
+	/*
+	 * For now we drive only the primary framebuffer resource that
+	 * was set up at attach.  Phase 3.G adds the proper plane/fb
+	 * binding so userland's drm_framebuffer becomes the scanout
+	 * source.  Here we just re-publish the existing fb at whatever
+	 * size the mode requests, clipped to what we actually allocated.
+	 */
+	uint32_t w = mode->hdisplay;
+	uint32_t h = mode->vdisplay;
+	if (w > sc->vtgpu_fb_info.fb_width)
+		w = sc->vtgpu_fb_info.fb_width;
+	if (h > sc->vtgpu_fb_info.fb_height)
+		h = sc->vtgpu_fb_info.fb_height;
+
+	error = vtgpu_set_scanout(sc, 0, 0, w, h);
+	if (error != 0)
+		return (error);
+	(void)vtgpu_transfer_to_host_2d(sc, 0, 0, w, h);
+	(void)vtgpu_resource_flush(sc, 0, 0, w, h);
+	return (0);
+}
+
+static int
+virtio_drm_crtc_mode_set_base(struct drm_crtc *crtc, int x, int y,
+    struct drm_framebuffer *old_fb)
+{
+	/* Same operation as mode_set, minus the timing change. */
+	return (virtio_drm_crtc_mode_set(crtc, &crtc->mode, &crtc->mode,
+	    x, y, old_fb));
+}
+
+static void
+virtio_drm_crtc_prepare(struct drm_crtc *crtc)
+{
+	virtio_drm_crtc_dpms(crtc, DRM_MODE_DPMS_OFF);
+}
+
+static void
+virtio_drm_crtc_commit(struct drm_crtc *crtc)
+{
+	virtio_drm_crtc_dpms(crtc, DRM_MODE_DPMS_ON);
+}
+
+static const struct drm_crtc_helper_funcs virtio_drm_crtc_helper_funcs = {
+	.dpms		= virtio_drm_crtc_dpms,
+	.mode_fixup	= virtio_drm_crtc_mode_fixup,
+	.mode_set	= virtio_drm_crtc_mode_set,
+	.mode_set_base	= virtio_drm_crtc_mode_set_base,
+	.prepare	= virtio_drm_crtc_prepare,
+	.commit		= virtio_drm_crtc_commit,
+};
+
+static void
+virtio_drm_crtc_destroy(struct drm_crtc *crtc)
+{
+	drm_crtc_cleanup(crtc);
+}
+
+static const struct drm_crtc_funcs virtio_drm_crtc_funcs = {
+	.set_config	= drm_crtc_helper_set_config,
+	.destroy	= virtio_drm_crtc_destroy,
+};
+
+/*
  * Driver-load callback.  drm_get_platform_dev() calls this between
  * drm_get_minor() and drm_mode_group_init_legacy_group(); the latter
  * iterates dev->mode_config.crtc_list, so the mode_config MUST be
@@ -494,8 +635,17 @@ virtio_drm_drm_load(struct drm_device *ddev, unsigned long flags)
 	ddev->mode_config.funcs = __DECONST(struct drm_mode_config_funcs *,
 	    &virtio_drm_mode_config_funcs);
 
+	/*
+	 * Phase 3.D: create the single CRTC.  Pass NULL for the primary
+	 * plane; Phase 3.F replaces this with a real plane binding.
+	 */
+	drm_crtc_init(ddev, &sc->vtgpu_drm_crtc, &virtio_drm_crtc_funcs);
+	drm_crtc_helper_add(&sc->vtgpu_drm_crtc,
+	    &virtio_drm_crtc_helper_funcs);
+
 	device_printf(ddev->dev,
-	    "virtio_drm: drm_load mode_config bounds %ux%u..%ux%u\n",
+	    "virtio_drm: drm_load mode_config bounds %ux%u..%ux%u, "
+	    "1 CRTC ready\n",
 	    ddev->mode_config.min_width, ddev->mode_config.min_height,
 	    ddev->mode_config.max_width, ddev->mode_config.max_height);
 	return (0);
