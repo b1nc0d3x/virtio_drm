@@ -406,12 +406,28 @@ MODULE_DEPEND(virtio_drm, virtio, 1, 1, 1);
  * ===========================================================================
  */
 
-/* Driver-load callback — called by drm_dev_register after registration. */
+/*
+ * Driver-load callback.  drm_get_platform_dev() calls this between
+ * drm_get_minor() and drm_mode_group_init_legacy_group(); the latter
+ * iterates dev->mode_config.crtc_list, so the mode_config MUST be
+ * initialized before load returns or the framework crashes with a
+ * NULL deref on a zeroed list head.  We do the minimum required init
+ * here (drm_mode_config_init + max bounds); the proper bounds-from-
+ * EDID logic lands in Phase 3.C/E along with CRTC/connector objects.
+ */
 static int
 virtio_drm_drm_load(struct drm_device *ddev, unsigned long flags)
 {
 	(void)flags;
-	device_printf(ddev->dev, "virtio_drm: drm_load (Phase 3.A stub)\n");
+
+	drm_mode_config_init(ddev);
+	ddev->mode_config.min_width = 0;
+	ddev->mode_config.min_height = 0;
+	ddev->mode_config.max_width = 16384;
+	ddev->mode_config.max_height = 16384;
+
+	device_printf(ddev->dev,
+	    "virtio_drm: drm_load complete (mode_config initialized)\n");
 	return (0);
 }
 
@@ -419,7 +435,8 @@ virtio_drm_drm_load(struct drm_device *ddev, unsigned long flags)
 static int
 virtio_drm_drm_unload(struct drm_device *ddev)
 {
-	device_printf(ddev->dev, "virtio_drm: drm_unload (Phase 3.A stub)\n");
+	drm_mode_config_cleanup(ddev);
+	device_printf(ddev->dev, "virtio_drm: drm_unload\n");
 	return (0);
 }
 
@@ -456,7 +473,7 @@ static const struct drm_ioctl_desc virtio_drm_ioctls[] = {
 	/* per-driver ioctls land here in later phases */
 };
 
-static struct drm_driver __unused virtio_drm_drm_driver = {
+static struct drm_driver virtio_drm_drm_driver = {
 	.driver_features	= DRIVER_MODESET | DRIVER_GEM,
 	.load			= virtio_drm_drm_load,
 	.unload			= virtio_drm_drm_unload,
@@ -634,6 +651,35 @@ vtgpu_attach(device_t dev)
 	/* Phase 2.D test surface — dev.vgpu.<unit>.cursor_xy / _test_pattern. */
 	vtgpu_sysctl_setup(sc);
 
+	/*
+	 * Phase 3.B: register a drm_device so /dev/dri/card0 appears.
+	 * Failure is non-fatal — the fbio framebuffer + cursor paths
+	 * are already up and useful without DRM-KMS, and a missing
+	 * /dev/dri/card0 is recoverable (rebuild with 'device drm2',
+	 * reload).  Subsequent phases (3.C-H) wire CRTC/connector/
+	 * plane/dumb buffers onto this drm_device.
+	 */
+	{
+		struct drm_device *ddev;
+		int derr;
+
+		ddev = malloc(sizeof(*ddev), M_DEVBUF, M_WAITOK | M_ZERO);
+		derr = drm_get_platform_dev(dev, ddev,
+		    &virtio_drm_drm_driver);
+		if (derr == 0) {
+			sc->vtgpu_drm_dev = ddev;
+			device_printf(dev,
+			    "drm: registered /dev/dri/card%d\n",
+			    ddev->primary ? ddev->primary->index : 0);
+		} else {
+			free(ddev, M_DEVBUF);
+			device_printf(dev,
+			    "drm: drm_get_platform_dev failed: %d "
+			    "(is 'device drm2' in your KERNCONF?)\n",
+			    derr);
+		}
+	}
+
 	error = 0;
 
 fail:
@@ -650,6 +696,18 @@ vtgpu_detach(device_t dev)
 	struct vtgpu_softc *sc;
 
 	sc = device_get_softc(dev);
+
+	/*
+	 * Phase 3.B: unregister DRM device first so userland clients
+	 * see EBADF on /dev/dri/card0 before the underlying hardware
+	 * state is torn down.
+	 */
+	if (sc->vtgpu_drm_dev != NULL) {
+		drm_put_dev(sc->vtgpu_drm_dev);
+		/* drm_put_dev frees the drm_device. */
+		sc->vtgpu_drm_dev = NULL;
+	}
+
 	if (sc->vtgpu_have_fb_info)
 		vt_deallocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
 
