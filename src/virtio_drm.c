@@ -1174,6 +1174,72 @@ vtgpu_cursor_transfer(struct vtgpu_softc *sc)
 	return (0);
 }
 
+/*
+ * VIRTIO_GPU_CMD_UPDATE_CURSOR — refresh the cursor bitmap *and*
+ * its position.  Pushes our 64x64 BGRA buffer to the host via
+ * TRANSFER_TO_HOST_2D first (so the host has the current bits),
+ * then posts the UPDATE_CURSOR on the cursor vq.  Callers that
+ * only want to move the cursor should use vtgpu_move_cursor()
+ * instead — it skips the transfer and uses the fast-path command.
+ */
+static int
+vtgpu_update_cursor(struct vtgpu_softc *sc, uint32_t scanout,
+    uint32_t x, uint32_t y, uint32_t hot_x, uint32_t hot_y)
+{
+	struct virtio_gpu_update_cursor cmd = { 0 };
+	int error;
+
+	if (!sc->vtgpu_have_cursor_backing)
+		return (ENXIO);
+
+	error = vtgpu_cursor_transfer(sc);
+	if (error != 0)
+		return (error);
+
+	cmd.hdr.type = htole32(VIRTIO_GPU_CMD_UPDATE_CURSOR);
+	cmd.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	cmd.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	cmd.pos.scanout_id = htole32(scanout);
+	cmd.pos.x = htole32(x);
+	cmd.pos.y = htole32(y);
+	cmd.resource_id = htole32(VTGPU_CURSOR_RESOURCE_ID);
+	cmd.hot_x = htole32(hot_x);
+	cmd.hot_y = htole32(hot_y);
+
+	sc->vtgpu_cursor_x = x;
+	sc->vtgpu_cursor_y = y;
+	return (vtgpu_cursor_post(sc, &cmd));
+}
+
+/*
+ * VIRTIO_GPU_CMD_MOVE_CURSOR — fast-path position update.
+ * Same struct, but resource_id is unused and no bitmap transfer
+ * is performed.  This is what fires at mouse-move frequency.
+ */
+static int
+vtgpu_move_cursor(struct vtgpu_softc *sc, uint32_t scanout,
+    uint32_t x, uint32_t y)
+{
+	struct virtio_gpu_update_cursor cmd = { 0 };
+
+	if (!sc->vtgpu_have_cursor_backing)
+		return (ENXIO);
+
+	cmd.hdr.type = htole32(VIRTIO_GPU_CMD_MOVE_CURSOR);
+	cmd.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	cmd.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	cmd.pos.scanout_id = htole32(scanout);
+	cmd.pos.x = htole32(x);
+	cmd.pos.y = htole32(y);
+	/* resource_id, hot_x, hot_y intentionally zero. */
+
+	sc->vtgpu_cursor_x = x;
+	sc->vtgpu_cursor_y = y;
+	return (vtgpu_cursor_post(sc, &cmd));
+}
+
 static int
 vtgpu_set_scanout(struct vtgpu_softc *sc, uint32_t x, uint32_t y,
     uint32_t width, uint32_t height)
