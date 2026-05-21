@@ -407,27 +407,97 @@ MODULE_DEPEND(virtio_drm, virtio, 1, 1, 1);
  */
 
 /*
+ * Phase 3.C — drm_mode_config_funcs.
+ *
+ * fb_create is the entry point userland eventually uses to wrap a GEM
+ * buffer handle in a struct drm_framebuffer (drm_mode_addfb2 ioctl).
+ * Until Phase 3.G implements GEM-based dumb buffers, we can't honor
+ * that request — return ENOSYS so userland gets a clean error rather
+ * than us pretending and producing a stale fb.
+ *
+ * output_poll_changed is invoked by the connector polling machinery
+ * when hotplug state changes; without an fbdev emulation layer we
+ * have nothing to refresh here, so it's a no-op.
+ */
+static int
+virtio_drm_fb_create_stub(struct drm_device *ddev, struct drm_file *file,
+    struct drm_mode_fb_cmd2 *mode_cmd, struct drm_framebuffer **fb_out)
+{
+	(void)ddev;
+	(void)file;
+	(void)mode_cmd;
+	(void)fb_out;
+	return (-ENOSYS);
+}
+
+static void
+virtio_drm_output_poll_changed(struct drm_device *ddev)
+{
+	(void)ddev;
+}
+
+static const struct drm_mode_config_funcs virtio_drm_mode_config_funcs = {
+	.fb_create		= virtio_drm_fb_create_stub,
+	.output_poll_changed	= virtio_drm_output_poll_changed,
+};
+
+/*
  * Driver-load callback.  drm_get_platform_dev() calls this between
  * drm_get_minor() and drm_mode_group_init_legacy_group(); the latter
  * iterates dev->mode_config.crtc_list, so the mode_config MUST be
  * initialized before load returns or the framework crashes with a
- * NULL deref on a zeroed list head.  We do the minimum required init
- * here (drm_mode_config_init + max bounds); the proper bounds-from-
- * EDID logic lands in Phase 3.C/E along with CRTC/connector objects.
+ * NULL deref on a zeroed list head.
+ *
+ * Phase 3.C: derive sensible bounds from the host-reported scanout
+ * topology (cached by Phase 1.A) rather than leaving them at the
+ * permissive 16384x16384 we used in 3.B.  Sets up fb_create +
+ * output_poll_changed callbacks ready for the CRTC/connector/plane
+ * commits that follow.
  */
 static int
 virtio_drm_drm_load(struct drm_device *ddev, unsigned long flags)
 {
+	struct vtgpu_softc *sc;
+	uint32_t max_w, max_h;
+	uint32_t i;
+
 	(void)flags;
 
+	sc = device_get_softc(ddev->dev);
+
 	drm_mode_config_init(ddev);
+
+	/*
+	 * Bounds: start at the largest scanout dimension we've seen +
+	 * some headroom so dynamic resize via VIRTIO_GPU_EVENT_DISPLAY
+	 * within reason doesn't trip max-bounds checks.
+	 */
+	max_w = 0;
+	max_h = 0;
+	for (i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
+		if (!sc->vtgpu_scanouts[i].enabled)
+			continue;
+		if (sc->vtgpu_scanouts[i].width > max_w)
+			max_w = sc->vtgpu_scanouts[i].width;
+		if (sc->vtgpu_scanouts[i].height > max_h)
+			max_h = sc->vtgpu_scanouts[i].height;
+	}
+	if (max_w == 0)
+		max_w = 1920;
+	if (max_h == 0)
+		max_h = 1080;
+
 	ddev->mode_config.min_width = 0;
 	ddev->mode_config.min_height = 0;
-	ddev->mode_config.max_width = 16384;
-	ddev->mode_config.max_height = 16384;
+	ddev->mode_config.max_width = max_w * 4;	/* headroom */
+	ddev->mode_config.max_height = max_h * 4;
+	ddev->mode_config.funcs = __DECONST(struct drm_mode_config_funcs *,
+	    &virtio_drm_mode_config_funcs);
 
 	device_printf(ddev->dev,
-	    "virtio_drm: drm_load complete (mode_config initialized)\n");
+	    "virtio_drm: drm_load mode_config bounds %ux%u..%ux%u\n",
+	    ddev->mode_config.min_width, ddev->mode_config.min_height,
+	    ddev->mode_config.max_width, ddev->mode_config.max_height);
 	return (0);
 }
 
