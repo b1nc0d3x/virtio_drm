@@ -194,6 +194,17 @@ static int	vtgpu_transfer_to_host_2d(struct vtgpu_softc *, uint32_t,
 static int	vtgpu_resource_flush(struct vtgpu_softc *, uint32_t, uint32_t,
 		    uint32_t, uint32_t);
 
+/* Phase 2: hardware cursor. */
+static int	vtgpu_cursor_create_resource(struct vtgpu_softc *);
+static int	vtgpu_cursor_attach_backing(struct vtgpu_softc *);
+static int	vtgpu_cursor_detach_backing(struct vtgpu_softc *);
+static int	vtgpu_cursor_resource_unref(struct vtgpu_softc *);
+static int	vtgpu_cursor_transfer(struct vtgpu_softc *);
+static int	vtgpu_update_cursor(struct vtgpu_softc *, uint32_t, uint32_t,
+		    uint32_t, uint32_t, uint32_t);
+static int	vtgpu_move_cursor(struct vtgpu_softc *, uint32_t, uint32_t,
+		    uint32_t);
+
 static vd_blank_t		vtgpu_fb_blank;
 static vd_bitblt_text_t		vtgpu_fb_bitblt_text;
 static vd_bitblt_bmp_t		vtgpu_fb_bitblt_bitmap;
@@ -489,6 +500,27 @@ vtgpu_attach(device_t dev)
 		goto fail;
 	error = vtgpu_resource_flush(sc, 0, 0, sc->vtgpu_fb_info.fb_width,
 	    sc->vtgpu_fb_info.fb_height);
+	if (error != 0)
+		goto fail;
+
+	/*
+	 * Phase 2: set up the hardware cursor resource.  Failures here
+	 * are non-fatal — the primary framebuffer path is already up,
+	 * and a missing cursor just means UPDATE_CURSOR/MOVE_CURSOR
+	 * calls will fail gracefully later.
+	 */
+	sc->vtgpu_cursor_vbase = (vm_offset_t)contigmalloc(VTGPU_CURSOR_SIZE,
+	    M_DEVBUF, M_WAITOK | M_ZERO, 0, ~0, 4, 0);
+	if (sc->vtgpu_cursor_vbase != 0) {
+		sc->vtgpu_cursor_pbase =
+		    pmap_kextract(sc->vtgpu_cursor_vbase);
+		if (vtgpu_cursor_create_resource(sc) == 0) {
+			sc->vtgpu_have_cursor_resource = true;
+			if (vtgpu_cursor_attach_backing(sc) == 0)
+				sc->vtgpu_have_cursor_backing = true;
+		}
+	}
+	error = 0;
 
 fail:
 	if (error != 0)
@@ -524,6 +556,20 @@ vtgpu_detach(device_t dev)
 	if (sc->vtgpu_have_resource) {
 		(void)vtgpu_resource_unref(sc);
 		sc->vtgpu_have_resource = false;
+	}
+
+	/* Same teardown order for the cursor resource. */
+	if (sc->vtgpu_have_cursor_backing) {
+		(void)vtgpu_cursor_detach_backing(sc);
+		sc->vtgpu_have_cursor_backing = false;
+	}
+	if (sc->vtgpu_have_cursor_resource) {
+		(void)vtgpu_cursor_resource_unref(sc);
+		sc->vtgpu_have_cursor_resource = false;
+	}
+	if (sc->vtgpu_cursor_vbase != 0) {
+		free((void *)sc->vtgpu_cursor_vbase, M_DEVBUF);
+		sc->vtgpu_cursor_vbase = 0;
 	}
 
 	if (sc->vtgpu_fb_info.fb_vbase != 0) {
@@ -972,6 +1018,159 @@ vtgpu_resource_unref(struct vtgpu_softc *sc)
 		    le32toh(s.resp.type));
 		return (EINVAL);
 	}
+	return (0);
+}
+
+/* RESOURCE_CREATE_2D for the 64x64 BGRA cursor resource. */
+static int
+vtgpu_cursor_create_resource(struct vtgpu_softc *sc)
+{
+	struct {
+		struct virtio_gpu_resource_create_2d req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_CREATE_2D);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.resource_id = htole32(VTGPU_CURSOR_RESOURCE_ID);
+	s.req.format = htole32(VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM);
+	s.req.width = htole32(VTGPU_CURSOR_WIDTH);
+	s.req.height = htole32(VTGPU_CURSOR_HEIGHT);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA)) {
+		device_printf(sc->vtgpu_dev,
+		    "cursor CREATE_2D bad response 0x%x\n",
+		    le32toh(s.resp.type));
+		return (EINVAL);
+	}
+	return (0);
+}
+
+/* RESOURCE_ATTACH_BACKING for the cursor resource. */
+static int
+vtgpu_cursor_attach_backing(struct vtgpu_softc *sc)
+{
+	struct {
+		struct {
+			struct virtio_gpu_resource_attach_backing backing;
+			struct virtio_gpu_mem_entry mem[1];
+		} req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.backing.hdr.type =
+	    htole32(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+	s.req.backing.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.backing.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.backing.resource_id = htole32(VTGPU_CURSOR_RESOURCE_ID);
+	s.req.backing.nr_entries = htole32(1);
+	s.req.mem[0].addr = htole64(sc->vtgpu_cursor_pbase);
+	s.req.mem[0].length = htole32(VTGPU_CURSOR_SIZE);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA)) {
+		device_printf(sc->vtgpu_dev,
+		    "cursor ATTACH_BACKING bad response 0x%x\n",
+		    le32toh(s.resp.type));
+		return (EINVAL);
+	}
+	return (0);
+}
+
+/* RESOURCE_DETACH_BACKING for the cursor resource (teardown). */
+static int
+vtgpu_cursor_detach_backing(struct vtgpu_softc *sc)
+{
+	struct {
+		struct virtio_gpu_resource_detach_backing req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.resource_id = htole32(VTGPU_CURSOR_RESOURCE_ID);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (EINVAL);
+	return (0);
+}
+
+/* RESOURCE_UNREF for the cursor resource (teardown). */
+static int
+vtgpu_cursor_resource_unref(struct vtgpu_softc *sc)
+{
+	struct {
+		struct virtio_gpu_resource_unref req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_UNREF);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.resource_id = htole32(VTGPU_CURSOR_RESOURCE_ID);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (EINVAL);
+	return (0);
+}
+
+/* TRANSFER_TO_HOST_2D for the cursor — push our bitmap to the host. */
+static int
+vtgpu_cursor_transfer(struct vtgpu_softc *sc)
+{
+	struct {
+		struct virtio_gpu_transfer_to_host_2d req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.r.x = htole32(0);
+	s.req.r.y = htole32(0);
+	s.req.r.width = htole32(VTGPU_CURSOR_WIDTH);
+	s.req.r.height = htole32(VTGPU_CURSOR_HEIGHT);
+	s.req.offset = htole64(0);
+	s.req.resource_id = htole32(VTGPU_CURSOR_RESOURCE_ID);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (EINVAL);
 	return (0);
 }
 
