@@ -175,6 +175,8 @@ struct vtgpu_softc {
 	/* Phase 3: DRM-KMS frontend on the in-base drm2 stack. */
 	struct drm_device	*vtgpu_drm_dev;
 	struct drm_crtc		 vtgpu_drm_crtc;	/* one CRTC per device */
+	struct drm_encoder	 vtgpu_drm_encoder;
+	struct drm_connector	 vtgpu_drm_connector;
 };
 
 #define	VTGPU_CURSOR_RESOURCE_ID	2
@@ -583,6 +585,136 @@ static const struct drm_crtc_funcs virtio_drm_crtc_funcs = {
 };
 
 /*
+ * Phase 3.E — encoder + connector.
+ *
+ * VirtIO GPU has no physical encoder, but DRM's modeset model requires
+ * one between the connector and the CRTC.  We declare a no-op VIRTUAL
+ * encoder whose helper just defers everything to the CRTC.
+ *
+ * The connector is also VIRTUAL (DRM_MODE_CONNECTOR_VIRTUAL).  Its
+ * get_modes() feeds the EDID cached by Phase 1.B into
+ * drm_add_edid_modes(), which parses the standard and detailed mode
+ * descriptors and adds drm_display_mode entries to the connector's
+ * mode list.  mode_valid() clips to mode_config.max_*.  detect()
+ * always returns connected — a virtio-gpu scanout doesn't disappear.
+ */
+
+/* ----- encoder ----- */
+static void
+virtio_drm_encoder_destroy(struct drm_encoder *encoder)
+{
+	drm_encoder_cleanup(encoder);
+}
+static const struct drm_encoder_funcs virtio_drm_encoder_funcs = {
+	.destroy	= virtio_drm_encoder_destroy,
+};
+static void
+virtio_drm_encoder_dpms(struct drm_encoder *e, int mode) { (void)e; (void)mode; }
+static bool
+virtio_drm_encoder_mode_fixup(struct drm_encoder *e,
+    const struct drm_display_mode *m, struct drm_display_mode *a)
+{ (void)e; (void)m; (void)a; return (true); }
+static void
+virtio_drm_encoder_prepare(struct drm_encoder *e) { (void)e; }
+static void
+virtio_drm_encoder_commit(struct drm_encoder *e) { (void)e; }
+static void
+virtio_drm_encoder_mode_set(struct drm_encoder *e,
+    struct drm_display_mode *m, struct drm_display_mode *a)
+{ (void)e; (void)m; (void)a; }
+static const struct drm_encoder_helper_funcs virtio_drm_encoder_helper_funcs = {
+	.dpms		= virtio_drm_encoder_dpms,
+	.mode_fixup	= virtio_drm_encoder_mode_fixup,
+	.prepare	= virtio_drm_encoder_prepare,
+	.commit		= virtio_drm_encoder_commit,
+	.mode_set	= virtio_drm_encoder_mode_set,
+};
+
+/* ----- connector ----- */
+static int
+virtio_drm_connector_get_modes(struct drm_connector *connector)
+{
+	struct vtgpu_softc *sc;
+	struct edid *edid;
+	int count = 0;
+
+	sc = device_get_softc(connector->dev->dev);
+
+	if (sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].edid_size > 0) {
+		edid = (struct edid *)sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].edid;
+		drm_mode_connector_update_edid_property(connector, edid);
+		count = drm_add_edid_modes(connector, edid);
+	}
+	if (count == 0) {
+		/*
+		 * Host didn't give us a usable EDID — fall back to the
+		 * advertised scanout dimensions so userland sees at least
+		 * one mode.
+		 */
+		struct drm_display_mode *mode;
+		uint32_t w = sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].width;
+		uint32_t h = sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].height;
+		if (w == 0 || h == 0) { w = 1024; h = 768; }
+		mode = drm_cvt_mode(connector->dev, w, h, 60, false, false, false);
+		if (mode != NULL) {
+			drm_mode_probed_add(connector, mode);
+			count = 1;
+		}
+	}
+	return (count);
+}
+
+static int
+virtio_drm_connector_mode_valid(struct drm_connector *connector,
+    struct drm_display_mode *mode)
+{
+	if (mode->hdisplay > connector->dev->mode_config.max_width)
+		return (MODE_BAD);
+	if (mode->vdisplay > connector->dev->mode_config.max_height)
+		return (MODE_BAD);
+	return (MODE_OK);
+}
+
+static struct drm_encoder *
+virtio_drm_connector_best_encoder(struct drm_connector *connector)
+{
+	struct vtgpu_softc *sc = device_get_softc(connector->dev->dev);
+	return (&sc->vtgpu_drm_encoder);
+}
+
+static const struct drm_connector_helper_funcs
+    virtio_drm_connector_helper_funcs = {
+	.get_modes	= virtio_drm_connector_get_modes,
+	.mode_valid	= virtio_drm_connector_mode_valid,
+	.best_encoder	= virtio_drm_connector_best_encoder,
+};
+
+static enum drm_connector_status
+virtio_drm_connector_detect(struct drm_connector *connector, bool force)
+{
+	(void)connector;
+	(void)force;
+	return (connector_status_connected);
+}
+static void
+virtio_drm_connector_destroy(struct drm_connector *connector)
+{
+	drm_connector_cleanup(connector);
+}
+static void
+virtio_drm_connector_dpms(struct drm_connector *connector, int mode)
+{
+	(void)connector;
+	(void)mode;
+}
+static const struct drm_connector_funcs virtio_drm_connector_funcs = {
+	.dpms		= virtio_drm_connector_dpms,
+	.detect		= virtio_drm_connector_detect,
+	.fill_modes	= drm_helper_probe_single_connector_modes,
+	.destroy	= virtio_drm_connector_destroy,
+};
+
+/*
  * Driver-load callback.  drm_get_platform_dev() calls this between
  * drm_get_minor() and drm_mode_group_init_legacy_group(); the latter
  * iterates dev->mode_config.crtc_list, so the mode_config MUST be
@@ -643,9 +775,28 @@ virtio_drm_drm_load(struct drm_device *ddev, unsigned long flags)
 	drm_crtc_helper_add(&sc->vtgpu_drm_crtc,
 	    &virtio_drm_crtc_helper_funcs);
 
+	/*
+	 * Phase 3.E: encoder + connector.  Encoder is VIRTUAL (no real
+	 * encoding hardware).  Connector is VIRTUAL and feeds the cached
+	 * EDID into the mode list at probe time.
+	 */
+	sc->vtgpu_drm_encoder.possible_crtcs = 1;	/* CRTC #0 */
+	drm_encoder_init(ddev, &sc->vtgpu_drm_encoder,
+	    &virtio_drm_encoder_funcs, DRM_MODE_ENCODER_VIRTUAL);
+	drm_encoder_helper_add(&sc->vtgpu_drm_encoder,
+	    &virtio_drm_encoder_helper_funcs);
+
+	drm_connector_init(ddev, &sc->vtgpu_drm_connector,
+	    &virtio_drm_connector_funcs, DRM_MODE_CONNECTOR_VIRTUAL);
+	drm_connector_helper_add(&sc->vtgpu_drm_connector,
+	    &virtio_drm_connector_helper_funcs);
+	drm_mode_connector_attach_encoder(&sc->vtgpu_drm_connector,
+	    &sc->vtgpu_drm_encoder);
+	sc->vtgpu_drm_connector.encoder = &sc->vtgpu_drm_encoder;
+
 	device_printf(ddev->dev,
 	    "virtio_drm: drm_load mode_config bounds %ux%u..%ux%u, "
-	    "1 CRTC ready\n",
+	    "1 CRTC + 1 connector ready\n",
 	    ddev->mode_config.min_width, ddev->mode_config.min_height,
 	    ddev->mode_config.max_width, ddev->mode_config.max_height);
 	return (0);
