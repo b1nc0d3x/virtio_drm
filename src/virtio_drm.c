@@ -177,6 +177,10 @@ struct vtgpu_softc {
 	struct drm_crtc		 vtgpu_drm_crtc;	/* one CRTC per device */
 	struct drm_encoder	 vtgpu_drm_encoder;
 	struct drm_connector	 vtgpu_drm_connector;
+
+	/* Phase 3.G: dumb-buffer resource_id allocator (starts past 1
+	 * (primary fb) and 2 (cursor)). */
+	uint32_t		 vtgpu_next_resource_id;
 };
 
 #define	VTGPU_CURSOR_RESOURCE_ID	2
@@ -412,27 +416,81 @@ MODULE_DEPEND(virtio_drm, virtio, 1, 1, 1);
  */
 
 /*
- * Phase 3.C — drm_mode_config_funcs.
+ * Phase 3.C/G — drm_mode_config_funcs.
  *
- * fb_create is the entry point userland eventually uses to wrap a GEM
- * buffer handle in a struct drm_framebuffer (drm_mode_addfb2 ioctl).
- * Until Phase 3.G implements GEM-based dumb buffers, we can't honor
- * that request — return ENOSYS so userland gets a clean error rather
- * than us pretending and producing a stale fb.
- *
- * output_poll_changed is invoked by the connector polling machinery
- * when hotplug state changes; without an fbdev emulation layer we
- * have nothing to refresh here, so it's a no-op.
+ * fb_create wraps a GEM dumb-buffer handle in a drm_framebuffer.  Once
+ * Phase 3.G shipped, this is the path userland's DRM_IOCTL_MODE_ADDFB2
+ * takes.  output_poll_changed is invoked by the connector polling
+ * machinery on hotplug; with no fbdev emulation it's a no-op.
  */
+
+/* Full vtgpu_gem_bo definition is in the Phase 3.G block below. */
+struct vtgpu_gem_bo {
+	struct drm_gem_object	gem_obj;
+	vm_offset_t		vbase;
+	bus_addr_t		pbase;
+	size_t			size;
+	uint32_t		resource_id;
+	bool			host_resource_attached;
+};
+
+struct virtio_drm_framebuffer {
+	struct drm_framebuffer	base;
+	struct vtgpu_gem_bo	*bo;
+};
+
+static void
+virtio_drm_fb_destroy(struct drm_framebuffer *drm_fb)
+{
+	struct virtio_drm_framebuffer *fb = (struct virtio_drm_framebuffer *)drm_fb;
+
+	if (fb->bo != NULL)
+		drm_gem_object_unreference_unlocked(&fb->bo->gem_obj);
+	drm_framebuffer_cleanup(drm_fb);
+	free(fb, M_DEVBUF);
+}
+
 static int
-virtio_drm_fb_create_stub(struct drm_device *ddev, struct drm_file *file,
+virtio_drm_fb_create_handle(struct drm_framebuffer *drm_fb,
+    struct drm_file *file, unsigned int *handle)
+{
+	struct virtio_drm_framebuffer *fb = (struct virtio_drm_framebuffer *)drm_fb;
+	return (drm_gem_handle_create(file, &fb->bo->gem_obj, handle));
+}
+
+static const struct drm_framebuffer_funcs virtio_drm_fb_funcs = {
+	.destroy	= virtio_drm_fb_destroy,
+	.create_handle	= virtio_drm_fb_create_handle,
+};
+
+static int
+virtio_drm_fb_create(struct drm_device *ddev, struct drm_file *file,
     struct drm_mode_fb_cmd2 *mode_cmd, struct drm_framebuffer **fb_out)
 {
-	(void)ddev;
-	(void)file;
-	(void)mode_cmd;
-	(void)fb_out;
-	return (-ENOSYS);
+	struct drm_gem_object *gem_obj;
+	struct virtio_drm_framebuffer *fb;
+	int error;
+
+	gem_obj = drm_gem_object_lookup(ddev, file, mode_cmd->handles[0]);
+	if (gem_obj == NULL)
+		return (-ENOENT);
+
+	fb = malloc(sizeof(*fb), M_DEVBUF, M_WAITOK | M_ZERO);
+	fb->bo = (struct vtgpu_gem_bo *)gem_obj;
+	fb->base.pitches[0] = mode_cmd->pitches[0];
+	fb->base.offsets[0] = mode_cmd->offsets[0];
+	fb->base.width = mode_cmd->width;
+	fb->base.height = mode_cmd->height;
+	fb->base.depth = 24;
+	fb->base.bits_per_pixel = 32;
+	error = drm_framebuffer_init(ddev, &fb->base, &virtio_drm_fb_funcs);
+	if (error != 0) {
+		drm_gem_object_unreference_unlocked(gem_obj);
+		free(fb, M_DEVBUF);
+		return (error);
+	}
+	*fb_out = &fb->base;
+	return (0);
 }
 
 static void
@@ -442,7 +500,7 @@ virtio_drm_output_poll_changed(struct drm_device *ddev)
 }
 
 static const struct drm_mode_config_funcs virtio_drm_mode_config_funcs = {
-	.fb_create		= virtio_drm_fb_create_stub,
+	.fb_create		= virtio_drm_fb_create,
 	.output_poll_changed	= virtio_drm_output_poll_changed,
 };
 
@@ -715,6 +773,262 @@ static const struct drm_connector_funcs virtio_drm_connector_funcs = {
 };
 
 /*
+ * Phase 3.G — GEM bo + dumb-buffer alloc + framebuffer wrap.
+ *
+ * Each userland-requested dumb buffer is backed by:
+ *   - a contigmalloc'd guest page range (so we can ATTACH_BACKING
+ *     with a single sglist entry — same approach we use for the
+ *     attach-time primary fb and the cursor),
+ *   - a fresh virtio-gpu resource_id (allocated >= 3),
+ *   - a struct drm_gem_object so userland gets a handle and an
+ *     mmap path to the contig pages.
+ *
+ * gem_pager_ops.fault converts an mmap offset into a vm_page_t
+ * pointing at the appropriate page of the contig buffer; this
+ * lets userland fault-in pages of the buffer on demand.
+ */
+
+static int
+virtio_drm_bo_create_host_resource(struct vtgpu_softc *sc,
+    struct vtgpu_gem_bo *bo, uint32_t width, uint32_t height)
+{
+	struct {
+		struct virtio_gpu_resource_create_2d req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} cs = { 0 };
+	struct {
+		struct {
+			struct virtio_gpu_resource_attach_backing backing;
+			struct virtio_gpu_mem_entry mem[1];
+		} req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} as = { 0 };
+	int error;
+
+	cs.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_CREATE_2D);
+	cs.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	cs.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	cs.req.resource_id = htole32(bo->resource_id);
+	cs.req.format = htole32(VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM);
+	cs.req.width = htole32(width);
+	cs.req.height = htole32(height);
+	error = vtgpu_req_resp(sc, &cs.req, sizeof(cs.req), &cs.resp,
+	    sizeof(cs.resp));
+	if (error != 0 ||
+	    cs.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (-EIO);
+
+	as.req.backing.hdr.type = htole32(
+	    VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
+	as.req.backing.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	as.req.backing.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	as.req.backing.resource_id = htole32(bo->resource_id);
+	as.req.backing.nr_entries = htole32(1);
+	as.req.mem[0].addr = htole64(bo->pbase);
+	as.req.mem[0].length = htole32(bo->size);
+	error = vtgpu_req_resp(sc, &as.req, sizeof(as.req), &as.resp,
+	    sizeof(as.resp));
+	if (error != 0 ||
+	    as.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (-EIO);
+
+	bo->host_resource_attached = true;
+	return (0);
+}
+
+static void
+virtio_drm_bo_destroy_host_resource(struct vtgpu_softc *sc,
+    struct vtgpu_gem_bo *bo)
+{
+	struct {
+		struct virtio_gpu_resource_detach_backing req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} ds = { 0 };
+	struct {
+		struct virtio_gpu_resource_unref req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} us = { 0 };
+
+	if (!bo->host_resource_attached)
+		return;
+
+	ds.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING);
+	ds.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	ds.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	ds.req.resource_id = htole32(bo->resource_id);
+	(void)vtgpu_req_resp(sc, &ds.req, sizeof(ds.req), &ds.resp,
+	    sizeof(ds.resp));
+
+	us.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_UNREF);
+	us.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	us.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	us.req.resource_id = htole32(bo->resource_id);
+	(void)vtgpu_req_resp(sc, &us.req, sizeof(us.req), &us.resp,
+	    sizeof(us.resp));
+
+	bo->host_resource_attached = false;
+}
+
+/* drm_driver.gem_free_object */
+static void
+virtio_drm_gem_free_object(struct drm_gem_object *gem_obj)
+{
+	struct vtgpu_gem_bo *bo = (struct vtgpu_gem_bo *)gem_obj;
+	struct vtgpu_softc *sc = device_get_softc(gem_obj->dev->dev);
+
+	virtio_drm_bo_destroy_host_resource(sc, bo);
+	if (bo->vbase != 0)
+		free((void *)bo->vbase, M_DEVBUF);
+	drm_gem_object_release(gem_obj);
+	free(bo, M_DEVBUF);
+}
+
+/* gem_pager_ops: hand back the right page from the contig buffer. */
+static int
+virtio_drm_gem_pager_fault(vm_object_t vm_obj, vm_ooffset_t offset,
+    int prot, vm_page_t *mres)
+{
+	(void)prot;
+	struct drm_gem_object *gem_obj = vm_obj->handle;
+	struct vtgpu_gem_bo *bo = (struct vtgpu_gem_bo *)gem_obj;
+	vm_page_t page, oldm;
+	vm_paddr_t paddr;
+
+	if (offset >= bo->size)
+		return (VM_PAGER_FAIL);
+
+	paddr = bo->pbase + offset;
+	page = PHYS_TO_VM_PAGE(paddr);
+	if (page == NULL)
+		return (VM_PAGER_FAIL);
+	vm_page_busy_acquire(page, 0);
+
+	oldm = *mres;
+	if (oldm != NULL) {
+		vm_page_replace(page, vm_obj, oldm->pindex, oldm);
+	} else {
+		vm_page_insert(page, vm_obj, OFF_TO_IDX(offset));
+	}
+	page->valid = VM_PAGE_BITS_ALL;
+	*mres = page;
+	return (VM_PAGER_OK);
+}
+
+static int
+virtio_drm_gem_pager_ctor(void *handle, vm_ooffset_t size, vm_prot_t prot,
+    vm_ooffset_t foff, struct ucred *cred, u_short *color)
+{
+	(void)handle; (void)size; (void)prot; (void)foff; (void)cred;
+	if (color != NULL)
+		*color = 0;
+	return (0);
+}
+static void
+virtio_drm_gem_pager_dtor(void *handle) { (void)handle; }
+
+static struct cdev_pager_ops virtio_drm_gem_pager_ops = {
+	.cdev_pg_fault	= virtio_drm_gem_pager_fault,
+	.cdev_pg_ctor	= virtio_drm_gem_pager_ctor,
+	.cdev_pg_dtor	= virtio_drm_gem_pager_dtor,
+};
+
+/* drm_driver.dumb_create */
+static int
+virtio_drm_dumb_create(struct drm_file *file_priv, struct drm_device *ddev,
+    struct drm_mode_create_dumb *args)
+{
+	struct vtgpu_softc *sc = device_get_softc(ddev->dev);
+	struct vtgpu_gem_bo *bo;
+	size_t size;
+	int error;
+
+	args->pitch = (args->width * args->bpp + 7) / 8;
+	args->pitch = roundup(args->pitch, 64);
+	args->size = (uint64_t)args->pitch * args->height;
+	size = round_page(args->size);
+	if (size == 0)
+		return (-EINVAL);
+
+	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
+	bo->size = size;
+	bo->vbase = (vm_offset_t)contigmalloc(size, M_DEVBUF,
+	    M_WAITOK | M_ZERO, 0, ~0, 4, 0);
+	if (bo->vbase == 0) {
+		free(bo, M_DEVBUF);
+		return (-ENOMEM);
+	}
+	bo->pbase = pmap_kextract(bo->vbase);
+	bo->resource_id = atomic_fetchadd_32(&sc->vtgpu_next_resource_id, 1);
+
+	error = drm_gem_object_init(ddev, &bo->gem_obj, size);
+	if (error != 0)
+		goto err_free_pages;
+	error = drm_gem_create_mmap_offset(&bo->gem_obj);
+	if (error != 0)
+		goto err_gem_release;
+
+	error = virtio_drm_bo_create_host_resource(sc, bo,
+	    args->width, args->height);
+	if (error != 0)
+		goto err_gem_release;
+
+	error = drm_gem_handle_create(file_priv, &bo->gem_obj, &args->handle);
+	if (error != 0) {
+		virtio_drm_bo_destroy_host_resource(sc, bo);
+		goto err_gem_release;
+	}
+	drm_gem_object_unreference_unlocked(&bo->gem_obj);
+	return (0);
+
+err_gem_release:
+	drm_gem_object_release(&bo->gem_obj);
+err_free_pages:
+	free((void *)bo->vbase, M_DEVBUF);
+	free(bo, M_DEVBUF);
+	return (error);
+}
+
+/* drm_driver.dumb_map_offset */
+static int
+virtio_drm_dumb_map_offset(struct drm_file *file_priv,
+    struct drm_device *ddev, uint32_t handle, uint64_t *offset)
+{
+	struct drm_gem_object *gem_obj;
+	int error = 0;
+
+	DRM_LOCK(ddev);
+	gem_obj = drm_gem_object_lookup(ddev, file_priv, handle);
+	if (gem_obj == NULL) {
+		DRM_UNLOCK(ddev);
+		return (-EINVAL);
+	}
+	error = drm_gem_create_mmap_offset(gem_obj);
+	if (error == 0) {
+		*offset = DRM_GEM_MAPPING_OFF(gem_obj->map_list.key) |
+		    DRM_GEM_MAPPING_KEY;
+	}
+	drm_gem_object_unreference(gem_obj);
+	DRM_UNLOCK(ddev);
+	return (error);
+}
+
+/* drm_driver.dumb_destroy */
+static int
+virtio_drm_dumb_destroy(struct drm_file *file_priv,
+    struct drm_device *ddev, uint32_t handle)
+{
+	return (drm_gem_handle_delete(file_priv, handle));
+}
+
+/*
  * Driver-load callback.  drm_get_platform_dev() calls this between
  * drm_get_minor() and drm_mode_group_init_legacy_group(); the latter
  * iterates dev->mode_config.crtc_list, so the mode_config MUST be
@@ -851,6 +1165,11 @@ static struct drm_driver virtio_drm_drm_driver = {
 	.get_vblank_counter	= virtio_drm_get_vblank_counter,
 	.enable_vblank		= virtio_drm_enable_vblank,
 	.disable_vblank		= virtio_drm_disable_vblank,
+	.gem_free_object	= virtio_drm_gem_free_object,
+	.gem_pager_ops		= &virtio_drm_gem_pager_ops,
+	.dumb_create		= virtio_drm_dumb_create,
+	.dumb_map_offset	= virtio_drm_dumb_map_offset,
+	.dumb_destroy		= virtio_drm_dumb_destroy,
 	.ioctls			= __DECONST(struct drm_ioctl_desc *,
 				    virtio_drm_ioctls),
 	.num_ioctls		= nitems(virtio_drm_ioctls),
@@ -915,6 +1234,7 @@ vtgpu_attach(device_t dev)
 	sc->vtgpu_have_fb_info = false;
 	sc->vtgpu_dev = dev;
 	sc->vtgpu_next_fence = 1;
+	sc->vtgpu_next_resource_id = 3;	/* 1=primary fb, 2=cursor */
 	virtio_set_feature_desc(dev, vtgpu_feature_desc);
 
 	error = vtgpu_setup_features(sc);
