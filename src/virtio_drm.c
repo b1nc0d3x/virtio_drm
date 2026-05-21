@@ -1029,6 +1029,50 @@ virtio_drm_dumb_destroy(struct drm_file *file_priv,
 }
 
 /*
+ * Phase 3.H — vt(4) handover.
+ *
+ * When the first userland process opens /dev/dri/card0, hand the
+ * framebuffer to it: tear down vt(4)'s ownership so the console
+ * stops drawing characters into our scanout source.  When the last
+ * DRM fd closes, restore vt(4) so the console comes back.
+ *
+ * drm2 fires firstopen() on the very first open and lastclose() once
+ * the open-count drops to zero — exactly the brackets we need.
+ *
+ * Why this matters: without handover, vt(4)'s vd_bitblt_text callback
+ * keeps drawing console chars into the same framebuffer pages X (or
+ * kmscube) is mapping and writing.  You get garbled output where the
+ * X cursor and console cursor fight, and `dmesg` messages from other
+ * processes blink over X content.
+ */
+static int
+virtio_drm_drm_firstopen(struct drm_device *ddev)
+{
+	struct vtgpu_softc *sc = device_get_softc(ddev->dev);
+
+	if (sc->vtgpu_have_fb_info) {
+		vt_deallocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
+		sc->vtgpu_have_fb_info = false;
+		device_printf(ddev->dev,
+		    "virtio_drm: firstopen — vt(4) detached, DRM owns fb\n");
+	}
+	return (0);
+}
+
+static void
+virtio_drm_drm_lastclose(struct drm_device *ddev)
+{
+	struct vtgpu_softc *sc = device_get_softc(ddev->dev);
+
+	if (!sc->vtgpu_have_fb_info && sc->vtgpu_fb_info.fb_vbase != 0) {
+		vt_allocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
+		sc->vtgpu_have_fb_info = true;
+		device_printf(ddev->dev,
+		    "virtio_drm: lastclose — vt(4) restored\n");
+	}
+}
+
+/*
  * Driver-load callback.  drm_get_platform_dev() calls this between
  * drm_get_minor() and drm_mode_group_init_legacy_group(); the latter
  * iterates dev->mode_config.crtc_list, so the mode_config MUST be
@@ -1162,6 +1206,8 @@ static struct drm_driver virtio_drm_drm_driver = {
 	.driver_features	= DRIVER_MODESET | DRIVER_GEM,
 	.load			= virtio_drm_drm_load,
 	.unload			= virtio_drm_drm_unload,
+	.firstopen		= virtio_drm_drm_firstopen,
+	.lastclose		= virtio_drm_drm_lastclose,
 	.get_vblank_counter	= virtio_drm_get_vblank_counter,
 	.enable_vblank		= virtio_drm_enable_vblank,
 	.disable_vblank		= virtio_drm_disable_vblank,
