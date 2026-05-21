@@ -105,8 +105,19 @@
 #include <dev/vt/hw/fb/vt_fb.h>
 #include <dev/vt/colors/vt_termcolors.h>
 
+#include <dev/drm2/drmP.h>
+#include <dev/drm2/drm_crtc.h>
+#include <dev/drm2/drm_crtc_helper.h>
+#include <dev/drm2/drm_edid.h>
+
 #include "fb_if.h"
 #include "virtio_if.h"
+
+#define	VIRTIO_DRM_DRIVER_NAME	"virtio_drm"
+#define	VIRTIO_DRM_DRIVER_DESC	"FreeBSD VirtIO GPU DRM-KMS (arm64)"
+#define	VIRTIO_DRM_DRIVER_DATE	"20260521"
+#define	VIRTIO_DRM_DRIVER_MAJOR	0
+#define	VIRTIO_DRM_DRIVER_MINOR	1
 
 #define VTGPU_FEATURES	(1ULL << VIRTIO_GPU_F_EDID)
 
@@ -160,6 +171,9 @@ struct vtgpu_softc {
 	bool			 vtgpu_have_cursor_backing;
 	uint32_t		 vtgpu_cursor_x;
 	uint32_t		 vtgpu_cursor_y;
+
+	/* Phase 3: DRM-KMS frontend on the in-base drm2 stack. */
+	struct drm_device	*vtgpu_drm_dev;
 };
 
 #define	VTGPU_CURSOR_RESOURCE_ID	2
@@ -366,6 +380,98 @@ static driver_t vtgpu_driver = {
 VIRTIO_DRIVER_MODULE(virtio_drm, vtgpu_driver, vtgpu_modevent, NULL);
 MODULE_VERSION(virtio_drm, 1);
 MODULE_DEPEND(virtio_drm, virtio, 1, 1, 1);
+/*
+ * No MODULE_DEPEND on drm2 here: in-base FreeBSD drm2 is reached
+ * via 'device drm2' in the kernel config (statically linked), not
+ * via a separate loadable module.  The kernel must therefore have
+ * been built with drm2 — typical for arm64 development kernels
+ * that already host rk_drm or similar.  GENERIC does not include
+ * drm2; you must add 'device drm2' to a custom KERNCONF.
+ */
+
+/*
+ * ===========================================================================
+ * Phase 3 — DRM-KMS frontend on the in-base drm2 stack.
+ * ===========================================================================
+ *
+ * This is the section that turns virtio_drm from a fbio framebuffer driver
+ * into a real DRM-KMS driver: registers /dev/dri/card0, exposes a CRTC,
+ * connector, and plane to userland, and lets X11 / Wayland clients drive
+ * modesets and submit framebuffers.
+ *
+ * 3.A (this commit): drm_driver struct + stub callbacks only.  No DRM
+ * device is registered yet.  Subsequent commits wire up drm_get_pci_dev or
+ * equivalent (3.B), drm_mode_config_init (3.C), CRTC (3.D), connector
+ * (3.E), plane + dumb buffers + vt handover (3.F-H).
+ * ===========================================================================
+ */
+
+/* Driver-load callback — called by drm_dev_register after registration. */
+static int
+virtio_drm_drm_load(struct drm_device *ddev, unsigned long flags)
+{
+	(void)flags;
+	device_printf(ddev->dev, "virtio_drm: drm_load (Phase 3.A stub)\n");
+	return (0);
+}
+
+/* Driver-unload callback — symmetric to load. */
+static int
+virtio_drm_drm_unload(struct drm_device *ddev)
+{
+	device_printf(ddev->dev, "virtio_drm: drm_unload (Phase 3.A stub)\n");
+	return (0);
+}
+
+/*
+ * VBLANK callbacks.  Virtio-gpu has no real vblank — the host renders the
+ * framebuffer when we issue RESOURCE_FLUSH.  Return synthetic-counter
+ * values so userland sees consistent monotonic counts.
+ */
+static u32
+virtio_drm_get_vblank_counter(struct drm_device *ddev, int crtc)
+{
+	(void)ddev;
+	(void)crtc;
+	return (0);
+}
+
+static int
+virtio_drm_enable_vblank(struct drm_device *ddev, int crtc)
+{
+	(void)ddev;
+	(void)crtc;
+	return (0);
+}
+
+static void
+virtio_drm_disable_vblank(struct drm_device *ddev, int crtc)
+{
+	(void)ddev;
+	(void)crtc;
+}
+
+/* Empty ioctl table — DRM core ioctls handle the modesetting API. */
+static const struct drm_ioctl_desc virtio_drm_ioctls[] = {
+	/* per-driver ioctls land here in later phases */
+};
+
+static struct drm_driver __unused virtio_drm_drm_driver = {
+	.driver_features	= DRIVER_MODESET | DRIVER_GEM,
+	.load			= virtio_drm_drm_load,
+	.unload			= virtio_drm_drm_unload,
+	.get_vblank_counter	= virtio_drm_get_vblank_counter,
+	.enable_vblank		= virtio_drm_enable_vblank,
+	.disable_vblank		= virtio_drm_disable_vblank,
+	.ioctls			= __DECONST(struct drm_ioctl_desc *,
+				    virtio_drm_ioctls),
+	.num_ioctls		= nitems(virtio_drm_ioctls),
+	.name			= VIRTIO_DRM_DRIVER_NAME,
+	.desc			= VIRTIO_DRM_DRIVER_DESC,
+	.date			= VIRTIO_DRM_DRIVER_DATE,
+	.major			= VIRTIO_DRM_DRIVER_MAJOR,
+	.minor			= VIRTIO_DRM_DRIVER_MINOR,
+};
 
 VIRTIO_SIMPLE_PNPINFO(virtio_drm, VIRTIO_ID_GPU,
     "VirtIO GPU (virtio_drm)");

@@ -14,8 +14,8 @@
 
 KMOD=	virtio_drm
 SRCS=	virtio_drm.c
-SRCS+=	bus_if.h device_if.h virtio_bus_if.h virtio_if.h fb_if.h
-SRCS+=	opt_syscons.h opt_platform.h opt_acpi.h opt_teken.h opt_kbd.h opt_evdev.h opt_splash.h
+SRCS+=	bus_if.h device_if.h virtio_bus_if.h virtio_if.h fb_if.h pci_if.h
+SRCS+=	opt_syscons.h opt_platform.h opt_acpi.h opt_teken.h opt_kbd.h opt_evdev.h opt_splash.h opt_drm.h opt_vm.h
 
 # Default to native arch unless caller overrides TARGET_ARCH.
 .if defined(TARGET_ARCH)
