@@ -33,7 +33,51 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/* Driver for VirtIO GPU device. */
+/*
+ * Driver for the paravirtual VirtIO GPU device.
+ *
+ * ===========================================================================
+ * Why a virtual GPU driver?
+ * ===========================================================================
+ *
+ * FreeBSD/amd64 gets a modern DRM-KMS graphics stack through `drm-kmod`, a
+ * port of the Linux DRM drivers built on top of LinuxKPI (a Linux-kernel-API
+ * compatibility shim).  LinuxKPI has never been ported to aarch64.  As a
+ * result, every FreeBSD-arm64 VM and host today is stuck on `efifb`:
+ *
+ *   - a static framebuffer at whatever resolution UEFI happened to set,
+ *   - no modeset, no DPMS, no GPU acceleration,
+ *   - no `/dev/dri/card0`, so no X11 modesetting driver, no Wayland,
+ *   - no dynamic resize when the QEMU/UTM window changes,
+ *   - no second-monitor support.
+ *
+ * `virtio-gpu` is the paravirtual GPU defined by the VirtIO spec.  It is the
+ * display device exposed by every modern hypervisor that matters for arm64:
+ * QEMU/KVM, Apple's Virtualization.framework (UTM, vagrant-apple-vz), Cloud
+ * Hypervisor, Firecracker, and the arm64 paths of VMware and Xen.
+ *
+ * A real DRM-KMS driver for virtio-gpu therefore single-handedly closes the
+ * arm64 graphics gap for VMs — which is the dominant arm64-FreeBSD use case
+ * today (UTM on Apple Silicon, AWS Graviton consoles, qemu-system-aarch64
+ * dev VMs).  It also validates the methodology for non-LinuxKPI DRM drivers
+ * on FreeBSD/arm64, which is the same template needed for native hardware
+ * like Apple AGX, Mali, and the Rockchip Cadence DP.
+ *
+ * The in-base `sys/dev/virtio/gpu/virtio_gpu.c` (Bryan Venteicher 2013,
+ * Arm Ltd 2023) implements ~6 of the ~25 VirtIO GPU commands and exposes
+ * a fixed-resolution fbio framebuffer.  This driver picks up where that
+ * scaffold left off:
+ *
+ *   Phase 1 (this commit train): RESOURCE_UNREF / DETACH_BACKING lifecycle,
+ *           runtime GET_EDID, VIRTIO_GPU_EVENT_DISPLAY hotplug listener,
+ *           multi-scanout enumeration.  Still an fbio framebuffer but
+ *           now reflects what the host is actually advertising.
+ *   Phase 2:  cursor (UPDATE_CURSOR, MOVE_CURSOR) on the cursor vq.
+ *   Phase 3:  DRM-KMS frontend on the in-base drm2 stack — single CRTC,
+ *           connector, plane, dumb-buffer alloc → /dev/dri/card0.
+ *   Phase 4+: blob resources, render node, eventually VirGL/Venus.
+ * ===========================================================================
+ */
 
 #include <sys/param.h>
 #include <sys/types.h>
@@ -141,7 +185,7 @@ static vd_setpixel_t		vtgpu_fb_setpixel;
 static vd_bitblt_argb_t		vtgpu_fb_bitblt_argb;
 
 static struct vt_driver vtgpu_fb_driver = {
-	.vd_name = "virtio_gpu",
+	.vd_name = "virtio_drm",
 	.vd_init = vt_fb_init,
 	.vd_fini = vt_fb_fini,
 	.vd_blank = vtgpu_fb_blank,
@@ -159,7 +203,7 @@ static struct vt_driver vtgpu_fb_driver = {
 	.vd_resume = vt_fb_resume,
 };
 
-VT_DRIVER_DECLARE(vt_vtgpu, vtgpu_fb_driver);
+VT_DRIVER_DECLARE(vt_virtio_drm, vtgpu_fb_driver);
 
 static void
 vtgpu_fb_blank(struct vt_device *vd, term_color_t color)
@@ -284,7 +328,7 @@ static device_method_t vtgpu_methods[] = {
 };
 
 static driver_t vtgpu_driver = {
-	"vtgpu",
+	"vgpu",
 	vtgpu_methods,
 	sizeof(struct vtgpu_softc)
 };
@@ -316,12 +360,27 @@ vtgpu_modevent(module_t mod, int type, void *unused)
 	return (error);
 }
 
+/* Match the VirtIO GPU device-type ID and outrank the in-base driver. */
 static int
 vtgpu_probe(device_t dev)
 {
-	return (VIRTIO_SIMPLE_PROBE(dev, virtio_drm));
+	int rv;
+
+	rv = VIRTIO_SIMPLE_PROBE(dev, virtio_drm);
+	if (rv != BUS_PROBE_DEFAULT)
+		return (rv);
+
+	/*
+	 * Win the probe race against the in-base virtio_gpu driver
+	 * when both are present.  Both register on the virtio_pci bus
+	 * with BUS_PROBE_DEFAULT (-20); BUS_PROBE_VENDOR (-10) ranks
+	 * higher and lets the loadable module take ownership without
+	 * needing the user to do a runtime detach/rescan dance.
+	 */
+	return (BUS_PROBE_VENDOR);
 }
 
+/* Bring the device up: negotiate features, fetch displays + EDID, set scanout 0. */
 static int
 vtgpu_attach(device_t dev)
 {
@@ -421,6 +480,7 @@ fail:
 	return (error);
 }
 
+/* Release host-side resource (DETACH_BACKING + UNREF) before freeing pages. */
 static int
 vtgpu_detach(device_t dev)
 {
@@ -614,6 +674,7 @@ vtgpu_req_resp(struct vtgpu_softc *sc, void *req, size_t reqlen,
 	return (0);
 }
 
+/* VIRTIO_GPU_CMD_GET_DISPLAY_INFO — enumerate all enabled scanouts. */
 static int
 vtgpu_get_display_info(struct vtgpu_softc *sc)
 {
@@ -676,6 +737,7 @@ vtgpu_get_display_info(struct vtgpu_softc *sc)
 	return (0);
 }
 
+/* VIRTIO_GPU_CMD_GET_EDID — fetch EDID for one scanout into the softc cache. */
 static int
 vtgpu_get_edid(struct vtgpu_softc *sc, uint32_t scanout)
 {
@@ -798,6 +860,7 @@ vtgpu_attach_backing(struct vtgpu_softc *sc)
 	return (0);
 }
 
+/* VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING — host drops sglist on our pages. */
 static int
 vtgpu_detach_backing(struct vtgpu_softc *sc)
 {
@@ -828,6 +891,7 @@ vtgpu_detach_backing(struct vtgpu_softc *sc)
 	return (0);
 }
 
+/* VIRTIO_GPU_CMD_RESOURCE_UNREF — host drops the 2D resource record. */
 static int
 vtgpu_resource_unref(struct vtgpu_softc *sc)
 {
