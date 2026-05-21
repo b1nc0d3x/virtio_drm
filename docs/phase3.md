@@ -215,27 +215,32 @@ their own buffers and see output on screen.
 
 ---
 
-## 3.H — vt(4) handover  (pending)
+## 3.H — vt(4) handover  *(shipped)*
 
 **Problem solved:** vt(4) and the DRM userland session both want
 ownership of the framebuffer.  Without explicit handover, they fight:
-either the console keeps overwriting Xorg, or Xorg starves the
-console, or both crash.  This commit makes the two coexist cleanly.
+the console keeps overwriting X, or X starves the console, or both
+crash.  This commit makes the two coexist cleanly.
 
 **What:**
-- On the first successful `drm_open()` of `/dev/dri/card0`, call
-  `vt_deallocate()` so vt(4) lets go of the framebuffer.
-- In `drm_driver.lastclose` (last DRM fd closed), re-`vt_allocate()`
-  so the console comes back.
-
-**Why last:** it's purely a coexistence problem.  We don't need this
-for X to *work* — we need it for X to *not stomp on the console* (and
-vice-versa).  Landing it last means we can debug X bring-up without
-losing the serial console view of `dmesg`.
+- `drm_driver.firstopen`: on the first open of `/dev/dri/card0`, call
+  `vt_deallocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info)` and clear
+  `vtgpu_have_fb_info` so vt(4) stops drawing into our framebuffer
+  pages.
+- `drm_driver.lastclose`: on the last DRM fd close, re-`vt_allocate()`
+  if `vtgpu_have_fb_info` is false but `fb_vbase` is still valid.
+  Console comes back.
 
 **State after 3.H:** full DRM-KMS pipeline.  Userland sessions grab
 the display, modeset to EDID-derived resolutions, hand back to vt(4)
 on exit.  SLiM / X11 / Wayland are now viable on FreeBSD/arm64 VMs.
+
+**Note on re-allocate priority warning:**  vt(4) prints
+`Driver priority 110 too low. Current 110` when we re-allocate the
+same vt driver.  It's a vt internal warning when the new candidate's
+priority equals the current; benign for our re-allocate case because
+we're the same driver re-entering, not a different one trying to
+preempt.
 
 ---
 
