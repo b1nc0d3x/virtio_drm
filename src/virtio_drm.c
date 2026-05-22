@@ -836,10 +836,15 @@ virtio_drm_crtc_destroy(struct drm_crtc *crtc)
 }
 
 /*
- * Phase 3.I (page flip): re-target the active scanout when userland
- * does drmModePageFlip().  Without this, X's swap-buffers stays
- * blind to us — we keep flushing the original mode_set buffer while
- * X has rendered into a new one.
+ * Phase 5 (page flip): re-target the active scanout when userland
+ * does drmModePageFlip(), then deliver DRM_EVENT_FLIP_COMPLETE so
+ * the client (X / mesa / a Wayland comp) unblocks its swap-buffers.
+ *
+ * Virtio-GPU has no real vsync IRQ for us to wait on, so we treat
+ * the flip as instantaneous: TRANSFER_TO_HOST_2D the new buffer,
+ * SET_SCANOUT to retarget, RESOURCE_FLUSH to display, then send
+ * the vblank event right away.  This is the same model bochs and
+ * qxl use under Linux.
  */
 static int
 virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
@@ -847,10 +852,12 @@ virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 {
 	struct vtgpu_softc *sc;
 	struct virtio_drm_framebuffer *vfb;
+	uint32_t rid, w, h, pitch;
 
-	(void)event;
 	sc = device_get_softc(crtc->dev->dev);
 	vfb = (struct virtio_drm_framebuffer *)fb;
+	if (vfb->bo == NULL)
+		return (-EINVAL);
 
 	crtc->fb = fb;
 	sc->vtgpu_drm_active_resource_id = vfb->bo->resource_id;
@@ -859,8 +866,29 @@ virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	sc->vtgpu_drm_active_pitch = fb->pitches[0];
 	sc->vtgpu_drm_active_bo = vfb->bo;
 
-	(void)vtgpu_set_scanout_id(sc, vfb->bo->resource_id, 0, 0,
-	    fb->width, fb->height);
+	rid = vfb->bo->resource_id;
+	w = fb->width;
+	h = fb->height;
+	pitch = fb->pitches[0];
+
+	/* Push the back-buffer's contents from guest memory to the host
+	 * resource before retargeting; X may have rendered into vfb->bo
+	 * without first calling drmModeDirtyFB on it. */
+	if (vfb->bo->vbase != 0)
+		cpu_dcache_wb_range((void *)vfb->bo->vbase, vfb->bo->size);
+	(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
+	(void)vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
+	(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
+
+	atomic_add_32(&sc->vtgpu_drm_dirty_calls, 1);
+
+	/* Deliver the flip-complete event so the client wakes.  Must hold
+	 * dev->event_lock around drm_send_vblank_event. */
+	if (event != NULL) {
+		mtx_lock(&crtc->dev->event_lock);
+		drm_send_vblank_event(crtc->dev, 0, event);
+		mtx_unlock(&crtc->dev->event_lock);
+	}
 	return (0);
 }
 
@@ -1508,6 +1536,15 @@ virtio_drm_drm_load(struct drm_device *ddev, unsigned long flags)
 	drm_mode_connector_attach_encoder(&sc->vtgpu_drm_connector,
 	    &sc->vtgpu_drm_encoder);
 	sc->vtgpu_drm_connector.encoder = &sc->vtgpu_drm_encoder;
+
+	/* Vblank infrastructure: needed so drm_send_vblank_event() from
+	 * the page_flip handler can deliver DRM_EVENT_FLIP_COMPLETE.  We
+	 * have no real vsync IRQ — page_flip dispatches the event
+	 * synchronously — but drm core requires the per-crtc vblank
+	 * state to exist before any vblank-event helper will run. */
+	if (drm_vblank_init(ddev, 1) != 0)
+		device_printf(ddev->dev,
+		    "virtio_drm: drm_vblank_init failed (page flips will block)\n");
 
 	device_printf(ddev->dev,
 	    "virtio_drm: drm_load mode_config bounds %ux%u..%ux%u, "
