@@ -149,6 +149,35 @@ struct vtgpu_scanout {
 /* Forward decls; full types below in Phase 3.G block. */
 struct vtgpu_gem_bo;
 TAILQ_HEAD(vtgpu_bo_list, vtgpu_gem_bo);
+struct vtgpu_softc;
+
+/*
+ * Phase 7: one struct vtgpu_drm_head per enabled virtio-gpu scanout.
+ * The DRM-KMS objects (crtc/encoder/connector) live inline so we can
+ * container_of() from a drm_crtc / drm_connector pointer in a helper
+ * callback back to the per-head state.  active_* mirrors the resource
+ * the host is currently scanning out for that head.
+ */
+struct vtgpu_drm_head {
+	struct drm_crtc		crtc;
+	struct drm_encoder	encoder;
+	struct drm_connector	connector;
+	struct vtgpu_softc     *sc;
+	uint32_t		scanout_id;	/* virtio-gpu scanout slot */
+	uint32_t		index;		/* drm crtc index */
+	uint32_t		active_resource_id;
+	uint32_t		active_width;
+	uint32_t		active_height;
+	uint32_t		active_pitch;
+	struct vtgpu_gem_bo    *active_bo;
+};
+
+#define VTGPU_HEAD_FROM_CRTC(c) \
+	__containerof((c), struct vtgpu_drm_head, crtc)
+#define VTGPU_HEAD_FROM_CONN(c) \
+	__containerof((c), struct vtgpu_drm_head, connector)
+#define VTGPU_HEAD_FROM_ENC(e) \
+	__containerof((e), struct vtgpu_drm_head, encoder)
 
 struct vtgpu_softc {
 	/* Must be first so we can cast from info -> softc */
@@ -183,28 +212,18 @@ struct vtgpu_softc {
 
 	/* Phase 3: DRM-KMS frontend on the in-base drm2 stack. */
 	struct drm_device	*vtgpu_drm_dev;
-	struct drm_crtc		 vtgpu_drm_crtc;	/* one CRTC per device */
-	struct drm_encoder	 vtgpu_drm_encoder;
-	struct drm_connector	 vtgpu_drm_connector;
+	/* Phase 7: one head per enabled virtio-gpu scanout. */
+	struct vtgpu_drm_head	*vtgpu_drm_heads;
+	uint32_t		 vtgpu_drm_num_heads;
 
 	/* Phase 3.G: dumb-buffer resource_id allocator (starts past 1
 	 * (primary fb) and 2 (cursor)). */
 	uint32_t		 vtgpu_next_resource_id;
 
-	/* Phase 3.I/J: which resource (and geometry) the DRM CRTC has
-	 * pinned as the active scanout source.  A callout periodically
-	 * issues TRANSFER_TO_HOST_2D + RESOURCE_FLUSH on this resource
-	 * so userland CPU writes through mmap become visible without
-	 * needing a DRM_IOCTL_MODE_DIRTYFB from userland. */
-	uint32_t		 vtgpu_drm_active_resource_id;
-	uint32_t		 vtgpu_drm_active_width;
-	uint32_t		 vtgpu_drm_active_height;
-	uint32_t		 vtgpu_drm_active_pitch;
 	struct callout		 vtgpu_drm_flush_callout;
 	bool			 vtgpu_drm_flush_armed;
 	struct callout		 vtgpu_drm_vblank_callout;
 	int			 vtgpu_drm_vblank_users;
-	struct vtgpu_gem_bo	*vtgpu_drm_active_bo;	/* matches active_resource_id */
 	struct vtgpu_bo_list	 vtgpu_bos;		/* every dumb bo alive */
 	struct mtx		 vtgpu_bos_mtx;
 	uint32_t		 vtgpu_drm_dirty_calls;	/* # of .dirty hits */
@@ -246,8 +265,10 @@ static int	vtgpu_transfer_to_host_2d(struct vtgpu_softc *, uint32_t,
 static int	vtgpu_resource_flush(struct vtgpu_softc *, uint32_t, uint32_t,
 		    uint32_t, uint32_t);
 static int	vtgpu_set_scanout_blob_id(struct vtgpu_softc *, uint32_t,
-		    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+		    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+		    uint32_t);
 static int	vtgpu_set_scanout_id(struct vtgpu_softc *, uint32_t,
+		    uint32_t,
 		    uint32_t, uint32_t, uint32_t, uint32_t);
 static int	vtgpu_transfer_to_host_2d_id(struct vtgpu_softc *, uint32_t,
 		    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
@@ -666,11 +687,23 @@ static void
 virtio_drm_flush_tick(void *arg)
 {
 	struct vtgpu_softc *sc = arg;
-	uint32_t rid = sc->vtgpu_drm_active_resource_id;
-	uint32_t w = sc->vtgpu_drm_active_width;
-	uint32_t h = sc->vtgpu_drm_active_height;
-	uint32_t pitch = sc->vtgpu_drm_active_pitch;
-	struct vtgpu_gem_bo *bo = sc->vtgpu_drm_active_bo;
+	struct vtgpu_drm_head *head;
+	uint32_t rid, w, h, pitch;
+	struct vtgpu_gem_bo *bo;
+
+	/*
+	 * Flush head[0] only.  Multi-head configs typically render via
+	 * X's BlockHandler → drmModeDirtyFB on each connector, so a
+	 * periodic safety-net flush of the primary head is enough.
+	 */
+	if (sc->vtgpu_drm_heads == NULL || sc->vtgpu_drm_num_heads == 0)
+		return;
+	head = &sc->vtgpu_drm_heads[0];
+	rid = head->active_resource_id;
+	w = head->active_width;
+	h = head->active_height;
+	pitch = head->active_pitch;
+	bo = head->active_bo;
 
 	if (rid != 0 && w != 0 && h != 0) {
 		/*
@@ -714,30 +747,34 @@ static void
 virtio_drm_crtc_dpms(struct drm_crtc *crtc, int mode)
 {
 	struct vtgpu_softc *sc;
+	struct vtgpu_drm_head *head;
 
 	sc = device_get_softc(crtc->dev->dev);
+	head = VTGPU_HEAD_FROM_CRTC(crtc);
 
 	if (mode == DRM_MODE_DPMS_ON) {
-		uint32_t rid = sc->vtgpu_drm_active_resource_id;
-		uint32_t w = sc->vtgpu_drm_active_width;
-		uint32_t h = sc->vtgpu_drm_active_height;
+		uint32_t rid = head->active_resource_id;
+		uint32_t w = head->active_width;
+		uint32_t h = head->active_height;
 
-		if (rid == 0) {
-			/* No userland fb bound — fall back to the
-			 * attach-time primary fb (legacy resource_id=1). */
+		if (rid == 0 && head->index == 0) {
+			/* No userland fb bound on the primary head — fall
+			 * back to the attach-time primary fb
+			 * (legacy resource_id=1). */
 			rid = VTGPU_RESOURCE_ID;
 			w = sc->vtgpu_fb_info.fb_width;
 			h = sc->vtgpu_fb_info.fb_height;
 		}
-		if (sc->vtgpu_drm_active_bo != NULL &&
-		    sc->vtgpu_drm_active_bo->is_blob)
-			(void)vtgpu_set_scanout_blob_id(sc, rid, 0, 0, w, h,
-			    sc->vtgpu_drm_active_pitch);
+		if (head->active_bo != NULL && head->active_bo->is_blob)
+			(void)vtgpu_set_scanout_blob_id(sc, head->scanout_id,
+			    rid, 0, 0, w, h, head->active_pitch);
 		else
-			(void)vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
+			(void)vtgpu_set_scanout_id(sc, head->scanout_id, rid,
+			    0, 0, w, h);
 	} else {
-		/* Blank: point scanout at resource_id 0. */
-		(void)vtgpu_set_scanout_id(sc, 0, 0, 0, 0, 0);
+		/* Blank: point this scanout at resource_id 0. */
+		(void)vtgpu_set_scanout_id(sc, head->scanout_id, 0, 0, 0, 0,
+		    0);
 	}
 }
 
@@ -757,6 +794,7 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
     struct drm_framebuffer *old_fb)
 {
 	struct vtgpu_softc *sc;
+	struct vtgpu_drm_head *head;
 	struct virtio_drm_framebuffer *fb = NULL;
 	uint32_t rid, w, h, pitch;
 	int error;
@@ -767,6 +805,7 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 	(void)old_fb;
 
 	sc = device_get_softc(crtc->dev->dev);
+	head = VTGPU_HEAD_FROM_CRTC(crtc);
 
 	/*
 	 * Resolve the active framebuffer:
@@ -774,7 +813,9 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 	 *     it's at crtc->fb; that's a virtio_drm_framebuffer whose
 	 *     bo->resource_id is what the host should scan out.
 	 *   - Otherwise (no userland fb yet), fall back to our
-	 *     attach-time primary fb (resource_id == 1).
+	 *     attach-time primary fb (resource_id == 1) — only the
+	 *     primary head has that fallback; secondary heads with no
+	 *     fb stay blanked.
 	 */
 	if (crtc->fb != NULL) {
 		fb = (struct virtio_drm_framebuffer *)crtc->fb;
@@ -782,7 +823,7 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 		w = crtc->fb->width;
 		h = crtc->fb->height;
 		pitch = crtc->fb->pitches[0];
-	} else {
+	} else if (head->index == 0) {
 		rid = VTGPU_RESOURCE_ID;
 		w = mode->hdisplay;
 		h = mode->vdisplay;
@@ -791,12 +832,16 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 			w = sc->vtgpu_fb_info.fb_width;
 		if (h > sc->vtgpu_fb_info.fb_height)
 			h = sc->vtgpu_fb_info.fb_height;
+	} else {
+		return (0);	/* nothing to scan out on this head yet */
 	}
 
 	if (fb != NULL && fb->bo != NULL && fb->bo->is_blob)
-		error = vtgpu_set_scanout_blob_id(sc, rid, 0, 0, w, h, pitch);
+		error = vtgpu_set_scanout_blob_id(sc, head->scanout_id, rid,
+		    0, 0, w, h, pitch);
 	else
-		error = vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
+		error = vtgpu_set_scanout_id(sc, head->scanout_id, rid, 0, 0,
+		    w, h);
 	if (error != 0)
 		return (error);
 
@@ -805,11 +850,11 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 	(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
 
 	/* Remember active scanout source for the periodic flush. */
-	sc->vtgpu_drm_active_resource_id = rid;
-	sc->vtgpu_drm_active_width = w;
-	sc->vtgpu_drm_active_height = h;
-	sc->vtgpu_drm_active_pitch = pitch;
-	sc->vtgpu_drm_active_bo = (crtc->fb != NULL) ? fb->bo : NULL;
+	head->active_resource_id = rid;
+	head->active_width = w;
+	head->active_height = h;
+	head->active_pitch = pitch;
+	head->active_bo = (crtc->fb != NULL) ? fb->bo : NULL;
 
 	if (rid != VTGPU_RESOURCE_ID)
 		virtio_drm_flush_arm(sc);
@@ -871,10 +916,12 @@ virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
     struct drm_pending_vblank_event *event)
 {
 	struct vtgpu_softc *sc;
+	struct vtgpu_drm_head *head;
 	struct virtio_drm_framebuffer *vfb;
 	uint32_t rid, w, h, pitch;
 
 	sc = device_get_softc(crtc->dev->dev);
+	head = VTGPU_HEAD_FROM_CRTC(crtc);
 	vfb = (struct virtio_drm_framebuffer *)fb;
 	if (vfb->bo == NULL)
 		return (-EINVAL);
@@ -883,14 +930,14 @@ virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	 * running by the time we deliver the flip event.  Otherwise
 	 * drm_send_vblank_event returns seq=0/time=0 forever because
 	 * drm core thinks vblank IRQs are disabled. */
-	(void)drm_vblank_get(crtc->dev, 0);
+	(void)drm_vblank_get(crtc->dev, head->index);
 
 	crtc->fb = fb;
-	sc->vtgpu_drm_active_resource_id = vfb->bo->resource_id;
-	sc->vtgpu_drm_active_width = fb->width;
-	sc->vtgpu_drm_active_height = fb->height;
-	sc->vtgpu_drm_active_pitch = fb->pitches[0];
-	sc->vtgpu_drm_active_bo = vfb->bo;
+	head->active_resource_id = vfb->bo->resource_id;
+	head->active_width = fb->width;
+	head->active_height = fb->height;
+	head->active_pitch = fb->pitches[0];
+	head->active_bo = vfb->bo;
 
 	rid = vfb->bo->resource_id;
 	w = fb->width;
@@ -907,9 +954,11 @@ virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	if (!vfb->bo->is_blob)
 		(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
 	if (vfb->bo->is_blob)
-		(void)vtgpu_set_scanout_blob_id(sc, rid, 0, 0, w, h, pitch);
+		(void)vtgpu_set_scanout_blob_id(sc, head->scanout_id, rid, 0,
+		    0, w, h, pitch);
 	else
-		(void)vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
+		(void)vtgpu_set_scanout_id(sc, head->scanout_id, rid, 0, 0,
+		    w, h);
 	(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
 
 	atomic_add_32(&sc->vtgpu_drm_dirty_calls, 1);
@@ -918,12 +967,12 @@ virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	 * dev->event_lock around drm_send_vblank_event. */
 	if (event != NULL) {
 		mtx_lock(&crtc->dev->event_lock);
-		drm_send_vblank_event(crtc->dev, 0, event);
+		drm_send_vblank_event(crtc->dev, head->index, event);
 		mtx_unlock(&crtc->dev->event_lock);
 	}
 	/* Drop the refcount we took at the top; drm core will keep
 	 * vblank enabled if anyone else still wants events. */
-	drm_vblank_put(crtc->dev, 0);
+	drm_vblank_put(crtc->dev, head->index);
 	return (0);
 }
 
@@ -984,13 +1033,17 @@ static int
 virtio_drm_connector_get_modes(struct drm_connector *connector)
 {
 	struct vtgpu_softc *sc;
+	struct vtgpu_drm_head *head;
+	struct vtgpu_scanout *so;
 	struct edid *edid;
 	int count = 0;
 
 	sc = device_get_softc(connector->dev->dev);
+	head = VTGPU_HEAD_FROM_CONN(connector);
+	so = &sc->vtgpu_scanouts[head->scanout_id];
 
-	if (sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].edid_size > 0) {
-		edid = (struct edid *)sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].edid;
+	if (so->edid_size > 0) {
+		edid = (struct edid *)so->edid;
 		drm_mode_connector_update_edid_property(connector, edid);
 		count = drm_add_edid_modes(connector, edid);
 	}
@@ -1002,8 +1055,8 @@ virtio_drm_connector_get_modes(struct drm_connector *connector)
 		 * settings) has the usual list of selectable resolutions
 		 * up to the host's max scanout size.
 		 */
-		uint32_t w = sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].width;
-		uint32_t h = sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].height;
+		uint32_t w = so->width;
+		uint32_t h = so->height;
 		if (w == 0 || h == 0) { w = 1024; h = 768; }
 		count += drm_add_modes_noedid(connector, w, h);
 		if (count == 0) {
@@ -1033,8 +1086,8 @@ virtio_drm_connector_mode_valid(struct drm_connector *connector,
 static struct drm_encoder *
 virtio_drm_connector_best_encoder(struct drm_connector *connector)
 {
-	struct vtgpu_softc *sc = device_get_softc(connector->dev->dev);
-	return (&sc->vtgpu_drm_encoder);
+	struct vtgpu_drm_head *head = VTGPU_HEAD_FROM_CONN(connector);
+	return (&head->encoder);
 }
 
 static const struct drm_connector_helper_funcs
@@ -1047,9 +1100,13 @@ static const struct drm_connector_helper_funcs
 static enum drm_connector_status
 virtio_drm_connector_detect(struct drm_connector *connector, bool force)
 {
-	(void)connector;
+	struct vtgpu_softc *sc = device_get_softc(connector->dev->dev);
+	struct vtgpu_drm_head *head = VTGPU_HEAD_FROM_CONN(connector);
+
 	(void)force;
-	return (connector_status_connected);
+	if (sc->vtgpu_scanouts[head->scanout_id].enabled)
+		return (connector_status_connected);
+	return (connector_status_disconnected);
 }
 static void
 virtio_drm_connector_destroy(struct drm_connector *connector)
@@ -1230,8 +1287,10 @@ virtio_drm_gem_free_object(struct drm_gem_object *gem_obj)
 
 	mtx_lock(&sc->vtgpu_bos_mtx);
 	TAILQ_REMOVE(&sc->vtgpu_bos, bo, link);
-	if (sc->vtgpu_drm_active_bo == bo)
-		sc->vtgpu_drm_active_bo = NULL;
+	for (uint32_t i = 0; i < sc->vtgpu_drm_num_heads; i++) {
+		if (sc->vtgpu_drm_heads[i].active_bo == bo)
+			sc->vtgpu_drm_heads[i].active_bo = NULL;
+	}
 	mtx_unlock(&sc->vtgpu_bos_mtx);
 
 	virtio_drm_bo_destroy_host_resource(sc, bo);
@@ -1536,7 +1595,7 @@ virtio_drm_drm_lastclose(struct drm_device *ddev)
 	struct vtgpu_softc *sc = device_get_softc(ddev->dev);
 
 	virtio_drm_flush_disarm(sc);
-	sc->vtgpu_drm_active_resource_id = 0;
+	sc->vtgpu_drm_heads[0].active_resource_id = 0;
 
 	if (!sc->vtgpu_have_fb_info && sc->vtgpu_fb_info.fb_vbase != 0) {
 		vt_allocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
@@ -1600,46 +1659,77 @@ virtio_drm_drm_load(struct drm_device *ddev, unsigned long flags)
 	    &virtio_drm_mode_config_funcs);
 
 	/*
-	 * Phase 3.D: create the single CRTC.  Pass NULL for the primary
-	 * plane; Phase 3.F replaces this with a real plane binding.
+	 * Phase 7: one DRM head per enabled virtio-gpu scanout.  Each
+	 * head's encoder is wired to its own CRTC via possible_crtcs,
+	 * so X.org RandR / xrandr / xfce display settings can pose the
+	 * monitors independently.
 	 */
-	drm_crtc_init(ddev, &sc->vtgpu_drm_crtc, &virtio_drm_crtc_funcs);
-	drm_crtc_helper_add(&sc->vtgpu_drm_crtc,
-	    &virtio_drm_crtc_helper_funcs);
+	{
+		/*
+		 * Expose every scanout slot the device advertises in
+		 * num_scanouts, not just those QEMU currently reports as
+		 * enabled.  A scanout can be "disabled" simply because no
+		 * display backend is attached on the host side
+		 * (e.g. single -vnc but max_outputs=2); userland still
+		 * needs to see the connector so it can route a fb there.
+		 * The detect() helper will report disconnected status for
+		 * inactive scanouts.
+		 */
+		uint32_t n = sc->vtgpu_gpucfg.num_scanouts;
+		uint32_t idx;
+		if (n == 0 || n > VIRTIO_GPU_MAX_SCANOUTS)
+			n = 1;
+		sc->vtgpu_drm_heads = malloc(
+		    sizeof(struct vtgpu_drm_head) * n, M_DEVBUF,
+		    M_WAITOK | M_ZERO);
+		sc->vtgpu_drm_num_heads = n;
 
-	/*
-	 * Phase 3.E: encoder + connector.  Encoder is VIRTUAL (no real
-	 * encoding hardware).  Connector is VIRTUAL and feeds the cached
-	 * EDID into the mode list at probe time.
-	 */
-	sc->vtgpu_drm_encoder.possible_crtcs = 1;	/* CRTC #0 */
-	drm_encoder_init(ddev, &sc->vtgpu_drm_encoder,
-	    &virtio_drm_encoder_funcs, DRM_MODE_ENCODER_VIRTUAL);
-	drm_encoder_helper_add(&sc->vtgpu_drm_encoder,
-	    &virtio_drm_encoder_helper_funcs);
+		idx = 0;
+		for (i = 0; i < n; i++) {
+			struct vtgpu_drm_head *head =
+			    &sc->vtgpu_drm_heads[idx];
+			head->sc = sc;
+			head->scanout_id = i;
+			head->index = idx;
 
-	drm_connector_init(ddev, &sc->vtgpu_drm_connector,
-	    &virtio_drm_connector_funcs, DRM_MODE_CONNECTOR_VIRTUAL);
-	drm_connector_helper_add(&sc->vtgpu_drm_connector,
-	    &virtio_drm_connector_helper_funcs);
-	drm_mode_connector_attach_encoder(&sc->vtgpu_drm_connector,
-	    &sc->vtgpu_drm_encoder);
-	sc->vtgpu_drm_connector.encoder = &sc->vtgpu_drm_encoder;
+			drm_crtc_init(ddev, &head->crtc,
+			    &virtio_drm_crtc_funcs);
+			drm_crtc_helper_add(&head->crtc,
+			    &virtio_drm_crtc_helper_funcs);
+
+			head->encoder.possible_crtcs = 1u << idx;
+			drm_encoder_init(ddev, &head->encoder,
+			    &virtio_drm_encoder_funcs,
+			    DRM_MODE_ENCODER_VIRTUAL);
+			drm_encoder_helper_add(&head->encoder,
+			    &virtio_drm_encoder_helper_funcs);
+
+			drm_connector_init(ddev, &head->connector,
+			    &virtio_drm_connector_funcs,
+			    DRM_MODE_CONNECTOR_VIRTUAL);
+			drm_connector_helper_add(&head->connector,
+			    &virtio_drm_connector_helper_funcs);
+			drm_mode_connector_attach_encoder(&head->connector,
+			    &head->encoder);
+			head->connector.encoder = &head->encoder;
+			idx++;
+		}
+	}
 
 	/* Vblank infrastructure: needed so drm_send_vblank_event() from
-	 * the page_flip handler can deliver DRM_EVENT_FLIP_COMPLETE.  We
-	 * have no real vsync IRQ — page_flip dispatches the event
-	 * synchronously — but drm core requires the per-crtc vblank
-	 * state to exist before any vblank-event helper will run. */
-	if (drm_vblank_init(ddev, 1) != 0)
+	 * the page_flip handler can deliver DRM_EVENT_FLIP_COMPLETE.
+	 * One vblank slot per head. */
+	if (drm_vblank_init(ddev, sc->vtgpu_drm_num_heads) != 0)
 		device_printf(ddev->dev,
 		    "virtio_drm: drm_vblank_init failed (page flips will block)\n");
 
 	device_printf(ddev->dev,
 	    "virtio_drm: drm_load mode_config bounds %ux%u..%ux%u, "
-	    "1 CRTC + 1 connector ready\n",
+	    "%u head%s ready\n",
 	    ddev->mode_config.min_width, ddev->mode_config.min_height,
-	    ddev->mode_config.max_width, ddev->mode_config.max_height);
+	    ddev->mode_config.max_width, ddev->mode_config.max_height,
+	    sc->vtgpu_drm_num_heads,
+	    sc->vtgpu_drm_num_heads == 1 ? "" : "s");
 	return (0);
 }
 
@@ -1647,7 +1737,14 @@ virtio_drm_drm_load(struct drm_device *ddev, unsigned long flags)
 static int
 virtio_drm_drm_unload(struct drm_device *ddev)
 {
+	struct vtgpu_softc *sc = device_get_softc(ddev->dev);
+
 	drm_mode_config_cleanup(ddev);
+	if (sc->vtgpu_drm_heads != NULL) {
+		free(sc->vtgpu_drm_heads, M_DEVBUF);
+		sc->vtgpu_drm_heads = NULL;
+		sc->vtgpu_drm_num_heads = 0;
+	}
 	device_printf(ddev->dev, "virtio_drm: drm_unload\n");
 	return (0);
 }
@@ -2747,8 +2844,8 @@ vtgpu_sysctl_drm_active(SYSCTL_HANDLER_ARGS)
 
 	snprintf(buf, sizeof(buf),
 	    "resource=%u width=%u height=%u pitch=%u flush=%s",
-	    sc->vtgpu_drm_active_resource_id, sc->vtgpu_drm_active_width,
-	    sc->vtgpu_drm_active_height, sc->vtgpu_drm_active_pitch,
+	    sc->vtgpu_drm_heads[0].active_resource_id, sc->vtgpu_drm_heads[0].active_width,
+	    sc->vtgpu_drm_heads[0].active_height, sc->vtgpu_drm_heads[0].active_pitch,
 	    sc->vtgpu_drm_flush_armed ? "on" : "off");
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
 }
@@ -2785,7 +2882,7 @@ vtgpu_sysctl_drm_dumpall(SYSCTL_HANDLER_ARGS)
 		sbuf_printf(&sb,
 		    "rid=%u size=%zu px[0]=%08x px[1]=%08x nonzero=%zu/%zu%s\n",
 		    bo->resource_id, bo->size, px[0], px[1], nz, nsample,
-		    (bo == sc->vtgpu_drm_active_bo) ? " [ACTIVE]" : "");
+		    (bo == sc->vtgpu_drm_heads[0].active_bo) ? " [ACTIVE]" : "");
 	}
 	mtx_unlock(&sc->vtgpu_bos_mtx);
 	error = sbuf_finish(&sb);
@@ -2802,7 +2899,7 @@ static int
 vtgpu_sysctl_drm_peek(SYSCTL_HANDLER_ARGS)
 {
 	struct vtgpu_softc *sc = arg1;
-	struct vtgpu_gem_bo *bo = sc->vtgpu_drm_active_bo;
+	struct vtgpu_gem_bo *bo = sc->vtgpu_drm_heads[0].active_bo;
 	char buf[160];
 	int n = 0;
 
@@ -2814,7 +2911,7 @@ vtgpu_sysctl_drm_peek(SYSCTL_HANDLER_ARGS)
 	uint32_t *px = (uint32_t *)bo->vbase;
 	n = snprintf(buf, sizeof(buf),
 	    "rid=%u size=%zu px[0..7]=%08x %08x %08x %08x %08x %08x %08x %08x",
-	    sc->vtgpu_drm_active_resource_id, bo->size,
+	    sc->vtgpu_drm_heads[0].active_resource_id, bo->size,
 	    px[0], px[1], px[2], px[3], px[4], px[5], px[6], px[7]);
 	(void)n;
 	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
@@ -2839,7 +2936,7 @@ vtgpu_sysctl_drm_test_fill(SYSCTL_HANDLER_ARGS)
 	if (error != 0 || req->newptr == NULL || val == 0)
 		return (error);
 
-	bo = sc->vtgpu_drm_active_bo;
+	bo = sc->vtgpu_drm_heads[0].active_bo;
 	if (bo == NULL || bo->vbase == 0) {
 		device_printf(sc->vtgpu_dev,
 		    "drm_test_fill: no active bo\n");
@@ -2858,15 +2955,15 @@ vtgpu_sysctl_drm_test_fill(SYSCTL_HANDLER_ARGS)
 	for (i = 0; i < npixels; i++)
 		px[i] = color;
 
-	(void)vtgpu_transfer_to_host_2d_id(sc, sc->vtgpu_drm_active_resource_id,
-	    0, 0, sc->vtgpu_drm_active_width, sc->vtgpu_drm_active_height,
-	    sc->vtgpu_drm_active_pitch);
-	(void)vtgpu_resource_flush_id(sc, sc->vtgpu_drm_active_resource_id,
-	    0, 0, sc->vtgpu_drm_active_width, sc->vtgpu_drm_active_height);
+	(void)vtgpu_transfer_to_host_2d_id(sc, sc->vtgpu_drm_heads[0].active_resource_id,
+	    0, 0, sc->vtgpu_drm_heads[0].active_width, sc->vtgpu_drm_heads[0].active_height,
+	    sc->vtgpu_drm_heads[0].active_pitch);
+	(void)vtgpu_resource_flush_id(sc, sc->vtgpu_drm_heads[0].active_resource_id,
+	    0, 0, sc->vtgpu_drm_heads[0].active_width, sc->vtgpu_drm_heads[0].active_height);
 
 	device_printf(sc->vtgpu_dev,
 	    "drm_test_fill: filled bo rid=%u with 0x%08x, flushed\n",
-	    sc->vtgpu_drm_active_resource_id, color);
+	    sc->vtgpu_drm_heads[0].active_resource_id, color);
 	return (0);
 }
 
@@ -2879,20 +2976,20 @@ vtgpu_sysctl_drm_force_flush(SYSCTL_HANDLER_ARGS)
 	error = sysctl_handle_int(oidp, &val, 0, req);
 	if (error != 0 || req->newptr == NULL || val == 0)
 		return (error);
-	if (sc->vtgpu_drm_active_resource_id == 0) {
+	if (sc->vtgpu_drm_heads[0].active_resource_id == 0) {
 		device_printf(sc->vtgpu_dev,
 		    "drm_force_flush: no active scanout resource\n");
 		return (0);
 	}
-	(void)vtgpu_transfer_to_host_2d_id(sc, sc->vtgpu_drm_active_resource_id,
-	    0, 0, sc->vtgpu_drm_active_width, sc->vtgpu_drm_active_height,
-	    sc->vtgpu_drm_active_pitch);
-	(void)vtgpu_resource_flush_id(sc, sc->vtgpu_drm_active_resource_id,
-	    0, 0, sc->vtgpu_drm_active_width, sc->vtgpu_drm_active_height);
+	(void)vtgpu_transfer_to_host_2d_id(sc, sc->vtgpu_drm_heads[0].active_resource_id,
+	    0, 0, sc->vtgpu_drm_heads[0].active_width, sc->vtgpu_drm_heads[0].active_height,
+	    sc->vtgpu_drm_heads[0].active_pitch);
+	(void)vtgpu_resource_flush_id(sc, sc->vtgpu_drm_heads[0].active_resource_id,
+	    0, 0, sc->vtgpu_drm_heads[0].active_width, sc->vtgpu_drm_heads[0].active_height);
 	device_printf(sc->vtgpu_dev,
 	    "drm_force_flush: pushed rid=%u %ux%u (pitch=%u)\n",
-	    sc->vtgpu_drm_active_resource_id, sc->vtgpu_drm_active_width,
-	    sc->vtgpu_drm_active_height, sc->vtgpu_drm_active_pitch);
+	    sc->vtgpu_drm_heads[0].active_resource_id, sc->vtgpu_drm_heads[0].active_width,
+	    sc->vtgpu_drm_heads[0].active_height, sc->vtgpu_drm_heads[0].active_pitch);
 	return (0);
 }
 
@@ -3059,7 +3156,8 @@ vtgpu_resource_flush(struct vtgpu_softc *sc, uint32_t x, uint32_t y,
  * instead of always reusing the attach-time fb (resource_id == 1).
  */
 static int
-vtgpu_set_scanout_id(struct vtgpu_softc *sc, uint32_t resource_id,
+vtgpu_set_scanout_id(struct vtgpu_softc *sc, uint32_t scanout_id,
+    uint32_t resource_id,
     uint32_t x, uint32_t y, uint32_t width, uint32_t height)
 {
 	struct {
@@ -3077,7 +3175,7 @@ vtgpu_set_scanout_id(struct vtgpu_softc *sc, uint32_t resource_id,
 	s.req.r.y = htole32(y);
 	s.req.r.width = htole32(width);
 	s.req.r.height = htole32(height);
-	s.req.scanout_id = htole32(sc->vtgpu_primary_scanout);
+	s.req.scanout_id = htole32(scanout_id);
 	s.req.resource_id = htole32(resource_id);
 
 	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
@@ -3098,7 +3196,8 @@ vtgpu_set_scanout_id(struct vtgpu_softc *sc, uint32_t resource_id,
  * of the driver advertises in dumb_create / fb_create.
  */
 static int
-vtgpu_set_scanout_blob_id(struct vtgpu_softc *sc, uint32_t resource_id,
+vtgpu_set_scanout_blob_id(struct vtgpu_softc *sc, uint32_t scanout_id,
+    uint32_t resource_id,
     uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t pitch)
 {
 	struct {
@@ -3116,7 +3215,7 @@ vtgpu_set_scanout_blob_id(struct vtgpu_softc *sc, uint32_t resource_id,
 	s.req.r.y = htole32(y);
 	s.req.r.width = htole32(width);
 	s.req.r.height = htole32(height);
-	s.req.scanout_id = htole32(sc->vtgpu_primary_scanout);
+	s.req.scanout_id = htole32(scanout_id);
 	s.req.resource_id = htole32(resource_id);
 	s.req.width = htole32(width);
 	s.req.height = htole32(height);
