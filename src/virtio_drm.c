@@ -122,7 +122,8 @@
 #define	VIRTIO_DRM_DRIVER_MAJOR	0
 #define	VIRTIO_DRM_DRIVER_MINOR	1
 
-#define VTGPU_FEATURES	(1ULL << VIRTIO_GPU_F_EDID)
+#define VTGPU_FEATURES	((1ULL << VIRTIO_GPU_F_EDID) | \
+			 (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB))
 
 /* The guest can allocate resource IDs, we only need one */
 #define	VTGPU_RESOURCE_ID	1
@@ -244,6 +245,8 @@ static int	vtgpu_transfer_to_host_2d(struct vtgpu_softc *, uint32_t,
 		    uint32_t, uint32_t, uint32_t);
 static int	vtgpu_resource_flush(struct vtgpu_softc *, uint32_t, uint32_t,
 		    uint32_t, uint32_t);
+static int	vtgpu_set_scanout_blob_id(struct vtgpu_softc *, uint32_t,
+		    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 static int	vtgpu_set_scanout_id(struct vtgpu_softc *, uint32_t,
 		    uint32_t, uint32_t, uint32_t, uint32_t);
 static int	vtgpu_transfer_to_host_2d_id(struct vtgpu_softc *, uint32_t,
@@ -467,6 +470,7 @@ struct vtgpu_gem_bo {
 	vm_page_t		*pages;		/* npages entries */
 	uint32_t		resource_id;
 	bool			host_resource_attached;
+	bool			is_blob;	/* RESOURCE_CREATE_BLOB-backed */
 	vm_object_t		cdev_pager;	/* userland mmap pager */
 	TAILQ_ENTRY(vtgpu_gem_bo) link;		/* on sc->vtgpu_bos */
 };
@@ -541,7 +545,9 @@ virtio_drm_fb_dirty(struct drm_framebuffer *drm_fb,
 		if (fb->bo->vbase != 0)
 			cpu_dcache_wb_range((void *)fb->bo->vbase,
 			    fb->bo->size);
-		(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
+		if (!fb->bo->is_blob)
+			(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0,
+			    w, h, pitch);
 		(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
 		return (0);
 	}
@@ -568,8 +574,9 @@ virtio_drm_fb_dirty(struct drm_framebuffer *drm_fb,
 			    (void *)(fb->bo->vbase + (size_t)y1 * pitch),
 			    (size_t)ch * pitch);
 		}
-		(void)vtgpu_transfer_to_host_2d_id(sc, rid, x1, y1, cw, ch,
-		    pitch);
+		if (!fb->bo->is_blob)
+			(void)vtgpu_transfer_to_host_2d_id(sc, rid, x1, y1,
+			    cw, ch, pitch);
 		(void)vtgpu_resource_flush_id(sc, rid, x1, y1, cw, ch);
 	}
 	return (0);
@@ -674,7 +681,9 @@ virtio_drm_flush_tick(void *arg)
 		 */
 		if (bo != NULL && bo->vbase != 0)
 			cpu_dcache_wb_range((void *)bo->vbase, bo->size);
-		(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
+		if (bo == NULL || !bo->is_blob)
+			(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0,
+			    w, h, pitch);
 		(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
 	}
 	if (sc->vtgpu_drm_flush_armed)
@@ -720,7 +729,12 @@ virtio_drm_crtc_dpms(struct drm_crtc *crtc, int mode)
 			w = sc->vtgpu_fb_info.fb_width;
 			h = sc->vtgpu_fb_info.fb_height;
 		}
-		(void)vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
+		if (sc->vtgpu_drm_active_bo != NULL &&
+		    sc->vtgpu_drm_active_bo->is_blob)
+			(void)vtgpu_set_scanout_blob_id(sc, rid, 0, 0, w, h,
+			    sc->vtgpu_drm_active_pitch);
+		else
+			(void)vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
 	} else {
 		/* Blank: point scanout at resource_id 0. */
 		(void)vtgpu_set_scanout_id(sc, 0, 0, 0, 0, 0);
@@ -743,7 +757,7 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
     struct drm_framebuffer *old_fb)
 {
 	struct vtgpu_softc *sc;
-	struct virtio_drm_framebuffer *fb;
+	struct virtio_drm_framebuffer *fb = NULL;
 	uint32_t rid, w, h, pitch;
 	int error;
 
@@ -779,11 +793,15 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 			h = sc->vtgpu_fb_info.fb_height;
 	}
 
-	error = vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
+	if (fb != NULL && fb->bo != NULL && fb->bo->is_blob)
+		error = vtgpu_set_scanout_blob_id(sc, rid, 0, 0, w, h, pitch);
+	else
+		error = vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
 	if (error != 0)
 		return (error);
 
-	(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
+	if (fb == NULL || fb->bo == NULL || !fb->bo->is_blob)
+		(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
 	(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
 
 	/* Remember active scanout source for the periodic flush. */
@@ -881,11 +899,17 @@ virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 
 	/* Push the back-buffer's contents from guest memory to the host
 	 * resource before retargeting; X may have rendered into vfb->bo
-	 * without first calling drmModeDirtyFB on it. */
+	 * without first calling drmModeDirtyFB on it.  Blob-backed
+	 * resources skip the transfer because the host is already
+	 * mapping our pages directly. */
 	if (vfb->bo->vbase != 0)
 		cpu_dcache_wb_range((void *)vfb->bo->vbase, vfb->bo->size);
-	(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
-	(void)vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
+	if (!vfb->bo->is_blob)
+		(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
+	if (vfb->bo->is_blob)
+		(void)vtgpu_set_scanout_blob_id(sc, rid, 0, 0, w, h, pitch);
+	else
+		(void)vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
 	(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
 
 	atomic_add_32(&sc->vtgpu_drm_dirty_calls, 1);
@@ -1110,6 +1134,53 @@ virtio_drm_bo_create_host_resource(struct vtgpu_softc *sc,
 		return (-EIO);
 
 	bo->host_resource_attached = true;
+	return (0);
+}
+
+/*
+ * Phase 6 (VIRTIO_GPU_F_RESOURCE_BLOB): create a single host resource
+ * that points at our guest pages directly — no host-side staging copy
+ * and no per-flush TRANSFER_TO_HOST_2D round-trip.
+ *
+ * We negotiate blob_mem=GUEST + blob_flags=USE_MAPPABLE.  The host
+ * keeps the resource backed by the mem_entry sglist we hand it; for
+ * scanout it must be retargeted via SET_SCANOUT_BLOB (the legacy
+ * SET_SCANOUT doesn't carry format/stride and rejects blob ids).
+ *
+ * If the host doesn't advertise RESOURCE_BLOB we fall back to the
+ * legacy CREATE_2D + ATTACH_BACKING + TRANSFER_TO_HOST_2D path.
+ */
+static int
+virtio_drm_bo_create_host_blob(struct vtgpu_softc *sc,
+    struct vtgpu_gem_bo *bo)
+{
+	struct {
+		struct virtio_gpu_resource_create_blob hdr;
+		struct virtio_gpu_mem_entry mem[1];
+	} req = { 0 };
+	struct virtio_gpu_ctrl_hdr resp = { 0 };
+	int error;
+
+	req.hdr.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB);
+	req.hdr.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	req.hdr.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	req.hdr.resource_id = htole32(bo->resource_id);
+	req.hdr.blob_mem = htole32(VIRTIO_GPU_BLOB_MEM_GUEST);
+	req.hdr.blob_flags = htole32(VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE);
+	req.hdr.nr_entries = htole32(1);
+	req.hdr.blob_id = 0;
+	req.hdr.size = htole64(bo->size);
+	req.mem[0].addr = htole64(bo->pbase);
+	req.mem[0].length = htole32(bo->size);
+
+	error = vtgpu_req_resp(sc, &req, sizeof(req), &resp, sizeof(resp));
+	if (error != 0 ||
+	    resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (-EIO);
+
+	bo->host_resource_attached = true;
+	bo->is_blob = true;
 	return (0);
 }
 
@@ -1347,8 +1418,15 @@ retry_alloc:
 		VM_OBJECT_WUNLOCK(bo->cdev_pager);
 	}
 
-	error = virtio_drm_bo_create_host_resource(sc, bo,
-	    args->width, args->height);
+	if (sc->vtgpu_features & (1ULL << VIRTIO_GPU_F_RESOURCE_BLOB)) {
+		/* Zero-copy path: host maps our pages directly, no
+		 * per-frame TRANSFER_TO_HOST_2D needed. */
+		error = virtio_drm_bo_create_host_blob(sc, bo);
+	} else {
+		/* Legacy host: stage into a host-side copy. */
+		error = virtio_drm_bo_create_host_resource(sc, bo,
+		    args->width, args->height);
+	}
 	if (error != 0)
 		goto err_gem_release;
 
@@ -3001,6 +3079,50 @@ vtgpu_set_scanout_id(struct vtgpu_softc *sc, uint32_t resource_id,
 	s.req.r.height = htole32(height);
 	s.req.scanout_id = htole32(sc->vtgpu_primary_scanout);
 	s.req.resource_id = htole32(resource_id);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (EINVAL);
+	return (0);
+}
+
+/*
+ * SET_SCANOUT_BLOB — the blob equivalent.  Required when the
+ * target resource was created via RESOURCE_CREATE_BLOB, because
+ * blob resources carry no implicit format/stride and the legacy
+ * SET_SCANOUT command rejects them.  Currently fixed to
+ * BGRA8888 with a single-plane stride, matching what the rest
+ * of the driver advertises in dumb_create / fb_create.
+ */
+static int
+vtgpu_set_scanout_blob_id(struct vtgpu_softc *sc, uint32_t resource_id,
+    uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t pitch)
+{
+	struct {
+		struct virtio_gpu_set_scanout_blob req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_SET_SCANOUT_BLOB);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.r.x = htole32(x);
+	s.req.r.y = htole32(y);
+	s.req.r.width = htole32(width);
+	s.req.r.height = htole32(height);
+	s.req.scanout_id = htole32(sc->vtgpu_primary_scanout);
+	s.req.resource_id = htole32(resource_id);
+	s.req.width = htole32(width);
+	s.req.height = htole32(height);
+	s.req.format = htole32(VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM);
+	s.req.strides[0] = htole32(pitch);
+	s.req.offsets[0] = 0;
 
 	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
 	    sizeof(s.resp));
