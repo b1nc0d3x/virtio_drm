@@ -201,6 +201,8 @@ struct vtgpu_softc {
 	uint32_t		 vtgpu_drm_active_pitch;
 	struct callout		 vtgpu_drm_flush_callout;
 	bool			 vtgpu_drm_flush_armed;
+	struct callout		 vtgpu_drm_vblank_callout;
+	int			 vtgpu_drm_vblank_users;
 	struct vtgpu_gem_bo	*vtgpu_drm_active_bo;	/* matches active_resource_id */
 	struct vtgpu_bo_list	 vtgpu_bos;		/* every dumb bo alive */
 	struct mtx		 vtgpu_bos_mtx;
@@ -859,6 +861,12 @@ virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	if (vfb->bo == NULL)
 		return (-EINVAL);
 
+	/* Bump the vblank refcount so our synthetic-vsync callout is
+	 * running by the time we deliver the flip event.  Otherwise
+	 * drm_send_vblank_event returns seq=0/time=0 forever because
+	 * drm core thinks vblank IRQs are disabled. */
+	(void)drm_vblank_get(crtc->dev, 0);
+
 	crtc->fb = fb;
 	sc->vtgpu_drm_active_resource_id = vfb->bo->resource_id;
 	sc->vtgpu_drm_active_width = fb->width;
@@ -889,6 +897,9 @@ virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 		drm_send_vblank_event(crtc->dev, 0, event);
 		mtx_unlock(&crtc->dev->event_lock);
 	}
+	/* Drop the refcount we took at the top; drm core will keep
+	 * vblank enabled if anyone else still wants events. */
+	drm_vblank_put(crtc->dev, 0);
 	return (0);
 }
 
@@ -1564,31 +1575,59 @@ virtio_drm_drm_unload(struct drm_device *ddev)
 }
 
 /*
- * VBLANK callbacks.  Virtio-gpu has no real vblank — the host renders the
- * framebuffer when we issue RESOURCE_FLUSH.  Return synthetic-counter
- * values so userland sees consistent monotonic counts.
+ * VBLANK callbacks.  Virtio-gpu has no real vsync IRQ, so we synthesize
+ * one at 60 Hz via a callout.  Each tick calls drm_handle_vblank() which
+ * bumps the per-crtc counter and dispatches any queued vblank/flip events
+ * with a real sequence number + timestamp.  The callout only runs while
+ * userland actually wants vblank events (drm core ref-counts via
+ * enable/disable_vblank).
  */
+#define	VTGPU_VBLANK_HZ		60
+#define	VTGPU_VBLANK_PERIOD_US	(1000000 / VTGPU_VBLANK_HZ)
+
+static void
+virtio_drm_vblank_tick(void *arg)
+{
+	struct vtgpu_softc *sc = arg;
+	struct drm_device *ddev = sc->vtgpu_drm_dev;
+
+	if (ddev == NULL || sc->vtgpu_drm_vblank_users == 0)
+		return;
+	drm_handle_vblank(ddev, 0);
+	callout_reset(&sc->vtgpu_drm_vblank_callout,
+	    USEC_2_TICKS(VTGPU_VBLANK_PERIOD_US),
+	    virtio_drm_vblank_tick, sc);
+}
+
 static u32
 virtio_drm_get_vblank_counter(struct drm_device *ddev, int crtc)
 {
-	(void)ddev;
-	(void)crtc;
-	return (0);
+	return (drm_vblank_count(ddev, crtc));
 }
 
 static int
 virtio_drm_enable_vblank(struct drm_device *ddev, int crtc)
 {
-	(void)ddev;
+	struct vtgpu_softc *sc = device_get_softc(ddev->dev);
+
 	(void)crtc;
+	if (atomic_fetchadd_int(&sc->vtgpu_drm_vblank_users, 1) == 0) {
+		callout_reset(&sc->vtgpu_drm_vblank_callout,
+		    USEC_2_TICKS(VTGPU_VBLANK_PERIOD_US),
+		    virtio_drm_vblank_tick, sc);
+	}
 	return (0);
 }
 
 static void
 virtio_drm_disable_vblank(struct drm_device *ddev, int crtc)
 {
-	(void)ddev;
+	struct vtgpu_softc *sc = device_get_softc(ddev->dev);
+
 	(void)crtc;
+	if (atomic_fetchadd_int(&sc->vtgpu_drm_vblank_users, -1) == 1) {
+		callout_stop(&sc->vtgpu_drm_vblank_callout);
+	}
 }
 
 /* Empty ioctl table — DRM core ioctls handle the modesetting API. */
@@ -1677,6 +1716,7 @@ vtgpu_attach(device_t dev)
 	sc->vtgpu_next_fence = 1;
 	sc->vtgpu_next_resource_id = 3;	/* 1=primary fb, 2=cursor */
 	callout_init(&sc->vtgpu_drm_flush_callout, 1);
+	callout_init(&sc->vtgpu_drm_vblank_callout, 1);
 	sx_init(&sc->vtgpu_ctrl_sx, "vtgpu_ctrl_sx");
 	TAILQ_INIT(&sc->vtgpu_bos);
 	mtx_init(&sc->vtgpu_bos_mtx, "vtgpu_bos", NULL, MTX_DEF);
@@ -1834,6 +1874,7 @@ vtgpu_detach(device_t dev)
 	sc = device_get_softc(dev);
 
 	virtio_drm_flush_disarm(sc);
+	callout_drain(&sc->vtgpu_drm_vblank_callout);
 
 	/*
 	 * Phase 3.B: unregister DRM device first so userland clients
