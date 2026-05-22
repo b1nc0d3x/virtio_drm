@@ -1,0 +1,69 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026, Kyle Crenshaw
+ *
+ * Per-module ldscript for virtio_drm on aarch64.  Same section
+ * coalescing as sys/conf/ldscript.kmod.amd64 but with an explicit
+ * PHDRS declaration so the ELF header and program headers are
+ * embedded into PT_LOAD[0].
+ *
+ * Background: FreeBSD's standalone loader's __elfN(loadimage)
+ * walks PT_LOAD program headers and copies each segment's
+ * file_offset..file_offset+filesz to its target vaddr+off.  It does
+ * NOT copy the ELF header by itself — the header is only present in
+ * memory if some PT_LOAD covers file offset 0.
+ *
+ * On amd64 (CONSTANT(COMMONPAGESIZE)=0x1000) the default lld
+ * layout coincidentally puts PT_LOAD[0] at file offset 0 so the
+ * header lands at base+0.  link_elf_link_preload then dereferences
+ * ef->address as an Elf_Ehdr and everything works.
+ *
+ * On aarch64 (CONSTANT(COMMONPAGESIZE)=0x10000) the same default
+ * pushes PT_LOAD[0] to file offset 0x10000 — past the header —
+ * because the header + program headers + alignment slop don't fit
+ * in the first 64 KB.  link_elf_link_preload then reads garbage
+ * bytes from base+0 as if they were Elf_Ehdr; e_phoff is whatever
+ * happened to be in the first 32 bytes of .text, the resulting
+ * phdr pointer is wild, and the deref faults:
+ *
+ *     panic: vm_fault failed: ... preload_protect+0x54
+ *
+ * Forcing FILEHDR + PHDRS into the first PT_LOAD restores the
+ * "base+0 == Elf_Ehdr" invariant the kernel expects.
+ */
+
+PHDRS
+{
+	text	PT_LOAD FILEHDR PHDRS FLAGS(5);	/* R + X */
+	rodata	PT_LOAD FLAGS(4);		/* R     */
+	data	PT_LOAD FLAGS(6);		/* R + W */
+	dynamic	PT_DYNAMIC FLAGS(6);
+}
+
+SECTIONS
+{
+	/*
+	 * Reserve space for the ELF header + program headers at the
+	 * start of PT_LOAD[0].  Without this, ld can't fit FILEHDR +
+	 * PHDRS in front of .plt/.text at vaddr 0 ("could not allocate
+	 * headers").
+	 */
+	. = SIZEOF_HEADERS;
+
+	.plt		: { *(.plt) } :text
+
+	.text		:
+	{
+		*(.text .text.*)
+		. = ALIGN(CONSTANT(COMMONPAGESIZE));
+	} :text
+
+	.rodata		:
+	{
+		*(.rodata .rodata.*)
+		. = ALIGN(CONSTANT(COMMONPAGESIZE));
+	} :rodata
+
+	.data		: { *(.data .data.*) } :data
+	.dynamic	: { *(.dynamic) } :data :dynamic
+}

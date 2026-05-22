@@ -27,4 +27,19 @@ SYSDIR?=	/usr/src/sys
 
 CFLAGS+=	-I${SYSDIR}
 
+# NOTE on /boot/loader.conf preload:
+# Loading virtio_drm.ko via virtio_drm_load="YES" in /boot/loader.conf
+# currently panics on FreeBSD-arm64 inside preload_protect (link_elf.c
+# reads ef->address as Elf_Ehdr and gets garbage).  Root cause is
+# upstream — the arm64 EFI loader's elf64_loadimage sets fp->f_addr
+# (i.e. MODINFO_ADDR) such that the kernel cannot find the ELF header
+# at that address.  We tried forcing FILEHDR + PHDRS into PT_LOAD[0]
+# via a custom ldscript (ldscript.kmod.virtio_drm in this dir) and the
+# resulting .ko has the header in PT_LOAD[0] file_offset=0 vaddr=0 —
+# but the kernel still reads .text-like bytes from ef->address+0x20.
+# Bug filed for stand/efi/loader/arch/arm64 follow-up.
+#
+# Workaround: load at runtime via /etc/rc.conf kld_list="virtio_drm".
+# Adds ~1s to boot but is otherwise functionally equivalent.
+
 .include <bsd.kmod.mk>
