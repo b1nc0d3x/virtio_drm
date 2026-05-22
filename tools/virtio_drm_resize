@@ -1,0 +1,61 @@
+#!/bin/sh
+#
+# virtio_drm_resize WIDTH HEIGHT
+#
+# Invoked by devd when virtio_drm posts a DRM/RESIZE notification.
+# devd passes the new scanout dimensions as positional args (from the
+# event data's WIDTH= / HEIGHT= keys via $width / $height substitution
+# in /usr/local/etc/devd/virtio_drm.conf).
+#
+# Apply the dimensions to the active X session.  When the host scanout
+# resizes, the kernel re-fetches EDID from the host (QEMU/etc.) and
+# drm_kms_helper_hotplug_event causes X.org modesetting to re-probe
+# the connector.  The new EDID's detailed-timing descriptor for the
+# host's new resolution lands in the connector's mode list, so plain
+# `xrandr --output Virtual-1 --mode WxH --fb WxH` finds it.
+
+XRANDR=${XRANDR:-/usr/local/bin/xrandr}
+[ -x "$XRANDR" ] || exit 0
+
+# Log every invocation to /var/log/messages so we can see when the
+# devd hook fires.  syslog drops it under daemon.notice.
+logger -t virtio_drm_resize -p daemon.notice "fired W=$1 H=$2"
+
+W=${1:-0}
+H=${2:-0}
+case "$W" in ''|*[!0-9]*) exit 0 ;; esac
+case "$H" in ''|*[!0-9]*) exit 0 ;; esac
+[ "$W" -lt 100 ] || [ "$H" -lt 100 ] && exit 0
+
+OUTPUT=${OUTPUT:-Virtual-1}
+MODE="${W}x${H}"
+
+apply() {
+	auth=$1
+	user=$2
+	if [ -n "$user" ]; then
+		su -m "$user" -c \
+		    "DISPLAY=:0 XAUTHORITY=$auth $XRANDR >/dev/null 2>&1; \
+		     DISPLAY=:0 XAUTHORITY=$auth $XRANDR --output $OUTPUT --mode '$MODE' --fb '$MODE' 2>&1" \
+		    | logger -t virtio_drm_resize -p daemon.notice || true
+	else
+		# Force RandR mode list re-probe first; X may still be
+		# in the middle of an EDID update from our hotplug.
+		DISPLAY=:0 XAUTHORITY="$auth" \
+		    "$XRANDR" >/dev/null 2>&1 || true
+		DISPLAY=:0 XAUTHORITY="$auth" \
+		    "$XRANDR" --output $OUTPUT --mode "$MODE" --fb "$MODE" \
+		    2>&1 | logger -t virtio_drm_resize -p daemon.notice \
+		    || true
+	fi
+}
+
+[ -r /var/run/slim.auth ] && apply /var/run/slim.auth ""
+for home in /home/*; do
+	[ -d "$home" ] || continue
+	auth="$home/.Xauthority"
+	[ -r "$auth" ] || continue
+	apply "$auth" "$(basename "$home")"
+done
+
+exit 0

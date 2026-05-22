@@ -82,6 +82,7 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/bus.h>
+#include <sys/devctl.h>
 #include <sys/callout.h>
 #include <sys/fbio.h>
 #include <sys/kernel.h>
@@ -224,6 +225,7 @@ struct vtgpu_softc {
 	bool			 vtgpu_drm_flush_armed;
 	struct callout		 vtgpu_drm_vblank_callout;
 	int			 vtgpu_drm_vblank_users;
+	struct timeout_task	 vtgpu_resize_notify_task;
 	struct vtgpu_bo_list	 vtgpu_bos;		/* every dumb bo alive */
 	struct mtx		 vtgpu_bos_mtx;
 	uint32_t		 vtgpu_drm_dirty_calls;	/* # of .dirty hits */
@@ -258,6 +260,9 @@ static int	vtgpu_create_2d(struct vtgpu_softc *);
 static int	vtgpu_attach_backing(struct vtgpu_softc *);
 static int	vtgpu_detach_backing(struct vtgpu_softc *);
 static int	vtgpu_resource_unref(struct vtgpu_softc *);
+static int	virtio_drm_resize_console_fb(struct vtgpu_softc *,
+		    uint32_t, uint32_t);
+static void	virtio_drm_emit_resize_notify(void *, int);
 static int	vtgpu_set_scanout(struct vtgpu_softc *, uint32_t, uint32_t,
 		    uint32_t, uint32_t);
 static int	vtgpu_transfer_to_host_2d(struct vtgpu_softc *, uint32_t,
@@ -1892,6 +1897,8 @@ vtgpu_attach(device_t dev)
 	sc->vtgpu_next_resource_id = 3;	/* 1=primary fb, 2=cursor */
 	callout_init(&sc->vtgpu_drm_flush_callout, 1);
 	callout_init(&sc->vtgpu_drm_vblank_callout, 1);
+	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->vtgpu_resize_notify_task, 0,
+	    virtio_drm_emit_resize_notify, sc);
 	sx_init(&sc->vtgpu_ctrl_sx, "vtgpu_ctrl_sx");
 	TAILQ_INIT(&sc->vtgpu_bos);
 	mtx_init(&sc->vtgpu_bos_mtx, "vtgpu_bos", NULL, MTX_DEF);
@@ -2050,6 +2057,10 @@ vtgpu_detach(device_t dev)
 
 	virtio_drm_flush_disarm(sc);
 	callout_drain(&sc->vtgpu_drm_vblank_callout);
+	taskqueue_cancel_timeout(taskqueue_thread,
+	    &sc->vtgpu_resize_notify_task, NULL);
+	taskqueue_drain_timeout(taskqueue_thread,
+	    &sc->vtgpu_resize_notify_task);
 
 	/*
 	 * Phase 3.B: unregister DRM device first so userland clients
@@ -2108,6 +2119,38 @@ vtgpu_detach(device_t dev)
 }
 
 /*
+ * Drag-debounced devctl_notify trigger: each EVENT_DISPLAY resets a
+ * 250 ms callout to land here, so dragging the host VNC/GTK window
+ * corner fires exactly one userland notification when the user
+ * stops moving rather than one per pixel.
+ */
+static void
+virtio_drm_emit_resize_notify(void *arg, int pending)
+{
+	struct vtgpu_softc *sc = arg;
+	struct vtgpu_scanout *so =
+	    &sc->vtgpu_scanouts[sc->vtgpu_primary_scanout];
+	char data[64];
+
+	(void)pending;
+
+	/* If no DRM client owns the scanout, resize the vt(4) console
+	 * fb to the new host dimensions so the next console paint is
+	 * native-resolution.  Safe to do here because the callout runs
+	 * in soft-interrupt context but virtio_drm_resize_console_fb
+	 * blocks on vt_allocate; that's OK at this priority. */
+	if (so->enabled)
+		(void)virtio_drm_resize_console_fb(sc, so->width, so->height);
+
+	snprintf(data, sizeof(data),
+	    "width=%u height=%u scanout=%u",
+	    so->width, so->height, sc->vtgpu_primary_scanout);
+	devctl_notify("DRM",
+	    device_get_nameunit(sc->vtgpu_dev),
+	    "RESIZE", data);
+}
+
+/*
  * Called by the virtio framework when the device asserts a
  * config-change interrupt.  For virtio-gpu the only event
  * defined today is VIRTIO_GPU_EVENT_DISPLAY (scanout topology
@@ -2152,11 +2195,30 @@ vtgpu_config_change(device_t dev)
 						(void)vtgpu_get_edid(sc, i);
 				}
 			}
+			/* Console fb resize is also debounced via the
+			 * same resize_notify_callout — re-allocating
+			 * pages and recreating the host resource on
+			 * every pixel of drag is wasteful and prone to
+			 * tearing.  The deferred path (below + the
+			 * emit callout) handles it once per settled
+			 * drag.  See virtio_drm_emit_resize_notify. */
 			/* Tell DRM userland (X RandR, modesetting) to
 			 * re-probe the connector so the new host display
 			 * size becomes a selectable mode. */
 			if (sc->vtgpu_drm_dev != NULL)
 				drm_kms_helper_hotplug_event(sc->vtgpu_drm_dev);
+			/* Schedule (or reset) a trailing-edge debounced
+			 * task 250 ms in the future so a flurry of drag
+			 * events collapses into one console-fb resize +
+			 * one xrandr invocation when the user stops
+			 * dragging.  The task runs in taskqueue_thread
+			 * (process context) so vt_allocate / contigmalloc
+			 * / sleep are safe — a plain callout would land
+			 * us in interrupt context and panic. */
+			taskqueue_cancel_timeout(taskqueue_thread,
+			    &sc->vtgpu_resize_notify_task, NULL);
+			taskqueue_enqueue_timeout(taskqueue_thread,
+			    &sc->vtgpu_resize_notify_task, hz / 20);
 		}
 		cleared |= VIRTIO_GPU_EVENT_DISPLAY;
 	}
@@ -2367,6 +2429,100 @@ vtgpu_get_display_info(struct vtgpu_softc *sc)
 	sc->vtgpu_fb_info.fb_depth = 32;
 	sc->vtgpu_fb_info.fb_size = so->width * so->height * 4;
 	sc->vtgpu_fb_info.fb_stride = so->width * 4;
+	return (0);
+}
+
+/*
+ * Phase 8 — resize the vt(4) console framebuffer to match the new
+ * host scanout dimensions reported by VIRTIO_GPU_EVENT_DISPLAY.
+ *
+ * Only safe to call while no DRM client owns the scanout, since we
+ * tear down resource_id=1 (the console fb) and re-create it.  If
+ * X.org is already up the host is scanning out one of X's dumb bos
+ * via SET_SCANOUT, not resource_id=1, so the console fb just sits
+ * unused until vt(4) is restored on X exit — we skip the resize in
+ * that case and let X handle the host display change via the
+ * drm_kms_helper_hotplug_event path.
+ */
+static int
+virtio_drm_resize_console_fb(struct vtgpu_softc *sc, uint32_t new_w,
+    uint32_t new_h)
+{
+	int error;
+	uint32_t i;
+
+	if (!sc->vtgpu_have_fb_info)
+		return (0);
+	if (new_w == 0 || new_h == 0)
+		return (0);
+	if (new_w == sc->vtgpu_fb_info.fb_width &&
+	    new_h == sc->vtgpu_fb_info.fb_height)
+		return (0);
+
+	/* Skip if any DRM client has its own scanout active. */
+	for (i = 0; i < sc->vtgpu_drm_num_heads; i++) {
+		if (sc->vtgpu_drm_heads[i].active_bo != NULL)
+			return (0);
+	}
+
+	device_printf(sc->vtgpu_dev,
+	    "console fb resize: %ux%u -> %ux%u\n",
+	    sc->vtgpu_fb_info.fb_width, sc->vtgpu_fb_info.fb_height,
+	    new_w, new_h);
+
+	/* 1. Detach vt(4) from the old fb. */
+	vt_deallocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
+	sc->vtgpu_have_fb_info = false;
+
+	/* 2. Release host-side resource backing, then the resource. */
+	if (sc->vtgpu_have_backing) {
+		(void)vtgpu_detach_backing(sc);
+		sc->vtgpu_have_backing = false;
+	}
+	if (sc->vtgpu_have_resource) {
+		(void)vtgpu_resource_unref(sc);
+		sc->vtgpu_have_resource = false;
+	}
+
+	/* 3. Free old guest backing memory. */
+	if (sc->vtgpu_fb_info.fb_vbase != 0) {
+		free((void *)sc->vtgpu_fb_info.fb_vbase, M_DEVBUF);
+		sc->vtgpu_fb_info.fb_vbase = 0;
+		sc->vtgpu_fb_info.fb_pbase = 0;
+	}
+
+	/* 4. Update fb_info dimensions. */
+	sc->vtgpu_fb_info.fb_width = new_w;
+	sc->vtgpu_fb_info.fb_height = new_h;
+	sc->vtgpu_fb_info.fb_size = (size_t)new_w * new_h * 4;
+	sc->vtgpu_fb_info.fb_stride = new_w * 4;
+
+	/* 5. Reallocate backing + rebuild the host resource chain. */
+	sc->vtgpu_fb_info.fb_vbase = (vm_offset_t)contigmalloc(
+	    sc->vtgpu_fb_info.fb_size, M_DEVBUF, M_WAITOK | M_ZERO,
+	    0, ~0, 4, 0);
+	if (sc->vtgpu_fb_info.fb_vbase == 0)
+		return (ENOMEM);
+	sc->vtgpu_fb_info.fb_pbase = pmap_kextract(sc->vtgpu_fb_info.fb_vbase);
+
+	error = vtgpu_create_2d(sc);
+	if (error != 0)
+		return (error);
+	sc->vtgpu_have_resource = true;
+	error = vtgpu_attach_backing(sc);
+	if (error != 0)
+		return (error);
+	sc->vtgpu_have_backing = true;
+	error = vtgpu_set_scanout(sc, 0, 0, new_w, new_h);
+	if (error != 0)
+		return (error);
+
+	/* 6. Hand the new fb back to vt(4). */
+	vt_allocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
+	sc->vtgpu_have_fb_info = true;
+
+	(void)vtgpu_transfer_to_host_2d(sc, 0, 0, new_w, new_h);
+	(void)vtgpu_resource_flush(sc, 0, 0, new_w, new_h);
 	return (0);
 }
 
