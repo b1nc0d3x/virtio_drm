@@ -9,6 +9,7 @@ device_if.h
 virtio_bus_if.h
 virtio_if.h
 fb_if.h
+pci_if.h
 export_syms
 setdef*
 machine

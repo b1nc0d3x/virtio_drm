@@ -87,8 +87,11 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/sbuf.h>
 #include <sys/sglist.h>
 #include <sys/sysctl.h>
+#include <sys/pctrie.h>
+#include <sys/vmem.h>
 
 #include <machine/atomic.h>
 #include <machine/bus.h>
@@ -142,6 +145,10 @@ struct vtgpu_scanout {
 	uint8_t		edid[1024];
 };
 
+/* Forward decls; full types below in Phase 3.G block. */
+struct vtgpu_gem_bo;
+TAILQ_HEAD(vtgpu_bo_list, vtgpu_gem_bo);
+
 struct vtgpu_softc {
 	/* Must be first so we can cast from info -> softc */
 	struct fb_info 		 vtgpu_fb_info;
@@ -152,6 +159,7 @@ struct vtgpu_softc {
 
 	struct virtqueue	*vtgpu_ctrl_vq;
 	struct virtqueue	*vtgpu_cursor_vq;	/* Phase 2: vq #1 */
+	struct sx		 vtgpu_ctrl_sx;		/* serialize ctrl vq */
 
 	uint64_t		 vtgpu_next_fence;
 
@@ -181,6 +189,23 @@ struct vtgpu_softc {
 	/* Phase 3.G: dumb-buffer resource_id allocator (starts past 1
 	 * (primary fb) and 2 (cursor)). */
 	uint32_t		 vtgpu_next_resource_id;
+
+	/* Phase 3.I/J: which resource (and geometry) the DRM CRTC has
+	 * pinned as the active scanout source.  A callout periodically
+	 * issues TRANSFER_TO_HOST_2D + RESOURCE_FLUSH on this resource
+	 * so userland CPU writes through mmap become visible without
+	 * needing a DRM_IOCTL_MODE_DIRTYFB from userland. */
+	uint32_t		 vtgpu_drm_active_resource_id;
+	uint32_t		 vtgpu_drm_active_width;
+	uint32_t		 vtgpu_drm_active_height;
+	uint32_t		 vtgpu_drm_active_pitch;
+	struct callout		 vtgpu_drm_flush_callout;
+	bool			 vtgpu_drm_flush_armed;
+	struct vtgpu_gem_bo	*vtgpu_drm_active_bo;	/* matches active_resource_id */
+	struct vtgpu_bo_list	 vtgpu_bos;		/* every dumb bo alive */
+	struct mtx		 vtgpu_bos_mtx;
+	uint32_t		 vtgpu_drm_dirty_calls;	/* # of .dirty hits */
+	uint32_t		 vtgpu_drm_dirty_rects;	/* total clip rects */
 };
 
 #define	VTGPU_CURSOR_RESOURCE_ID	2
@@ -217,6 +242,12 @@ static int	vtgpu_transfer_to_host_2d(struct vtgpu_softc *, uint32_t,
 		    uint32_t, uint32_t, uint32_t);
 static int	vtgpu_resource_flush(struct vtgpu_softc *, uint32_t, uint32_t,
 		    uint32_t, uint32_t);
+static int	vtgpu_set_scanout_id(struct vtgpu_softc *, uint32_t,
+		    uint32_t, uint32_t, uint32_t, uint32_t);
+static int	vtgpu_transfer_to_host_2d_id(struct vtgpu_softc *, uint32_t,
+		    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+static int	vtgpu_resource_flush_id(struct vtgpu_softc *, uint32_t,
+		    uint32_t, uint32_t, uint32_t, uint32_t);
 
 /* Phase 2: hardware cursor. */
 static int	vtgpu_cursor_create_resource(struct vtgpu_softc *);
@@ -430,8 +461,12 @@ struct vtgpu_gem_bo {
 	vm_offset_t		vbase;
 	bus_addr_t		pbase;
 	size_t			size;
+	size_t			npages;
+	vm_page_t		*pages;		/* npages entries */
 	uint32_t		resource_id;
 	bool			host_resource_attached;
+	vm_object_t		cdev_pager;	/* userland mmap pager */
+	TAILQ_ENTRY(vtgpu_gem_bo) link;		/* on sc->vtgpu_bos */
 };
 
 struct virtio_drm_framebuffer {
@@ -458,9 +493,90 @@ virtio_drm_fb_create_handle(struct drm_framebuffer *drm_fb,
 	return (drm_gem_handle_create(file, &fb->bo->gem_obj, handle));
 }
 
+/*
+ * Phase 3.L — drm_framebuffer_funcs.dirty.
+ *
+ * This is the X.org modesetting driver's pixel-delivery contract:
+ * after rendering a region of an fb on the CPU side (via mmap),
+ * X calls DRM_IOCTL_MODE_DIRTYFB which the DRM core routes here.
+ * We translate each clip rect into VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D
+ * + RESOURCE_FLUSH so the host's scanout reflects the new pixels.
+ *
+ * Without this callback, X just sits there with all its rendering
+ * stuck in cached guest memory — visible to no one.
+ *
+ * num_clips == 0 means "whole framebuffer is dirty" — push it all.
+ *
+ * We dcache writeback the affected region first because the writes
+ * came from a userland VA that's already cleared the cache to L1
+ * but not down to memory in general.
+ */
+static int
+virtio_drm_fb_dirty(struct drm_framebuffer *drm_fb,
+    struct drm_file *file_priv, unsigned flags, unsigned color,
+    struct drm_clip_rect *clips, unsigned num_clips)
+{
+	struct virtio_drm_framebuffer *fb = (struct virtio_drm_framebuffer *)drm_fb;
+	struct vtgpu_softc *sc;
+	uint32_t rid, pitch, w, h;
+	unsigned i;
+
+	(void)file_priv; (void)flags; (void)color;
+	if (fb->bo == NULL)
+		return (-EINVAL);
+
+	sc = device_get_softc(drm_fb->dev->dev);
+	atomic_add_32(&sc->vtgpu_drm_dirty_calls, 1);
+	atomic_add_32(&sc->vtgpu_drm_dirty_rects,
+	    num_clips != 0 ? num_clips : 1);
+	rid = fb->bo->resource_id;
+	pitch = drm_fb->pitches[0];
+	w = drm_fb->width;
+	h = drm_fb->height;
+
+	if (num_clips == 0 || clips == NULL) {
+		/* Whole-fb path. */
+		if (fb->bo->vbase != 0)
+			cpu_dcache_wb_range((void *)fb->bo->vbase,
+			    fb->bo->size);
+		(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
+		(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
+		return (0);
+	}
+
+	for (i = 0; i < num_clips; i++) {
+		uint32_t x1 = clips[i].x1, y1 = clips[i].y1;
+		uint32_t x2 = clips[i].x2, y2 = clips[i].y2;
+		uint32_t cw, ch;
+
+		if (x2 <= x1 || y2 <= y1)
+			continue;
+		if (x2 > w) x2 = w;
+		if (y2 > h) y2 = h;
+		cw = x2 - x1;
+		ch = y2 - y1;
+
+		if (fb->bo->vbase != 0) {
+			/*
+			 * Tight cache writeback: only the row range that
+			 * contains the dirty rect.  The rect is a sub-
+			 * region of those rows.
+			 */
+			cpu_dcache_wb_range(
+			    (void *)(fb->bo->vbase + (size_t)y1 * pitch),
+			    (size_t)ch * pitch);
+		}
+		(void)vtgpu_transfer_to_host_2d_id(sc, rid, x1, y1, cw, ch,
+		    pitch);
+		(void)vtgpu_resource_flush_id(sc, rid, x1, y1, cw, ch);
+	}
+	return (0);
+}
+
 static const struct drm_framebuffer_funcs virtio_drm_fb_funcs = {
 	.destroy	= virtio_drm_fb_destroy,
 	.create_handle	= virtio_drm_fb_create_handle,
+	.dirty		= virtio_drm_fb_dirty,
 };
 
 static int
@@ -523,34 +639,89 @@ static const struct drm_mode_config_funcs virtio_drm_mode_config_funcs = {
  * then this CRTC is dormant from userland's perspective.
  */
 
+/*
+ * Phase 3.J — periodic dirty-fb flush.
+ *
+ * X's modesetting driver writes its framebuffer through CPU mmap.
+ * virtio-gpu needs an explicit TRANSFER_TO_HOST_2D + RESOURCE_FLUSH
+ * before those writes are visible to the host's scanout.  Without
+ * DRI3 + DRM_IOCTL_MODE_DIRTYFB from userland, we have to push them
+ * ourselves.
+ *
+ * Fire a callout at ~60 Hz that re-uploads the active scanout's
+ * whole buffer and flushes it.  Wasteful (full-frame every tick),
+ * but correct for the no-dirty-rect-tracking case and bounded by
+ * the 16 ms cadence.
+ */
+static void
+virtio_drm_flush_tick(void *arg)
+{
+	struct vtgpu_softc *sc = arg;
+	uint32_t rid = sc->vtgpu_drm_active_resource_id;
+	uint32_t w = sc->vtgpu_drm_active_width;
+	uint32_t h = sc->vtgpu_drm_active_height;
+	uint32_t pitch = sc->vtgpu_drm_active_pitch;
+	struct vtgpu_gem_bo *bo = sc->vtgpu_drm_active_bo;
+
+	if (rid != 0 && w != 0 && h != 0) {
+		/*
+		 * X's userland CPU writes via mmap sit in the cache
+		 * hierarchy — host (which DMAs by reading guest physical
+		 * RAM) sees stale memory unless we writeback the dcache
+		 * first.
+		 */
+		if (bo != NULL && bo->vbase != 0)
+			cpu_dcache_wb_range((void *)bo->vbase, bo->size);
+		(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
+		(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
+	}
+	if (sc->vtgpu_drm_flush_armed)
+		callout_reset(&sc->vtgpu_drm_flush_callout, hz,
+		    virtio_drm_flush_tick, sc);
+}
+
+static void
+virtio_drm_flush_arm(struct vtgpu_softc *sc)
+{
+	if (sc->vtgpu_drm_flush_armed)
+		return;
+	sc->vtgpu_drm_flush_armed = true;
+	/* 1 Hz for now — fast enough to demo, slow enough to not
+	 * starve X for control-vq access. */
+	callout_reset(&sc->vtgpu_drm_flush_callout, hz,
+	    virtio_drm_flush_tick, sc);
+}
+
+static void
+virtio_drm_flush_disarm(struct vtgpu_softc *sc)
+{
+	sc->vtgpu_drm_flush_armed = false;
+	callout_drain(&sc->vtgpu_drm_flush_callout);
+}
+
 static void
 virtio_drm_crtc_dpms(struct drm_crtc *crtc, int mode)
 {
 	struct vtgpu_softc *sc;
-	uint32_t scanout;
 
 	sc = device_get_softc(crtc->dev->dev);
-	scanout = sc->vtgpu_primary_scanout;
 
 	if (mode == DRM_MODE_DPMS_ON) {
-		(void)vtgpu_set_scanout(sc, 0, 0,
-		    sc->vtgpu_fb_info.fb_width,
-		    sc->vtgpu_fb_info.fb_height);
+		uint32_t rid = sc->vtgpu_drm_active_resource_id;
+		uint32_t w = sc->vtgpu_drm_active_width;
+		uint32_t h = sc->vtgpu_drm_active_height;
+
+		if (rid == 0) {
+			/* No userland fb bound — fall back to the
+			 * attach-time primary fb (legacy resource_id=1). */
+			rid = VTGPU_RESOURCE_ID;
+			w = sc->vtgpu_fb_info.fb_width;
+			h = sc->vtgpu_fb_info.fb_height;
+		}
+		(void)vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
 	} else {
-		/* Blank: point scanout at resource_id 0 to detach. */
-		struct {
-			struct virtio_gpu_set_scanout req;
-			char pad;
-			struct virtio_gpu_ctrl_hdr resp;
-		} s = { 0 };
-		s.req.hdr.type = htole32(VIRTIO_GPU_CMD_SET_SCANOUT);
-		s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
-		s.req.hdr.fence_id = htole64(
-		    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
-		s.req.scanout_id = htole32(scanout);
-		s.req.resource_id = htole32(0);
-		(void)vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
-		    sizeof(s.resp));
+		/* Blank: point scanout at resource_id 0. */
+		(void)vtgpu_set_scanout_id(sc, 0, 0, 0, 0, 0);
 	}
 }
 
@@ -570,6 +741,8 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
     struct drm_framebuffer *old_fb)
 {
 	struct vtgpu_softc *sc;
+	struct virtio_drm_framebuffer *fb;
+	uint32_t rid, w, h, pitch;
 	int error;
 
 	(void)adj;
@@ -580,24 +753,49 @@ virtio_drm_crtc_mode_set(struct drm_crtc *crtc, struct drm_display_mode *mode,
 	sc = device_get_softc(crtc->dev->dev);
 
 	/*
-	 * For now we drive only the primary framebuffer resource that
-	 * was set up at attach.  Phase 3.G adds the proper plane/fb
-	 * binding so userland's drm_framebuffer becomes the scanout
-	 * source.  Here we just re-publish the existing fb at whatever
-	 * size the mode requests, clipped to what we actually allocated.
+	 * Resolve the active framebuffer:
+	 *   - If userland bound a drm_framebuffer (via drmModeSetCrtc),
+	 *     it's at crtc->fb; that's a virtio_drm_framebuffer whose
+	 *     bo->resource_id is what the host should scan out.
+	 *   - Otherwise (no userland fb yet), fall back to our
+	 *     attach-time primary fb (resource_id == 1).
 	 */
-	uint32_t w = mode->hdisplay;
-	uint32_t h = mode->vdisplay;
-	if (w > sc->vtgpu_fb_info.fb_width)
-		w = sc->vtgpu_fb_info.fb_width;
-	if (h > sc->vtgpu_fb_info.fb_height)
-		h = sc->vtgpu_fb_info.fb_height;
+	if (crtc->fb != NULL) {
+		fb = (struct virtio_drm_framebuffer *)crtc->fb;
+		rid = fb->bo->resource_id;
+		w = crtc->fb->width;
+		h = crtc->fb->height;
+		pitch = crtc->fb->pitches[0];
+	} else {
+		rid = VTGPU_RESOURCE_ID;
+		w = mode->hdisplay;
+		h = mode->vdisplay;
+		pitch = sc->vtgpu_fb_info.fb_stride;
+		if (w > sc->vtgpu_fb_info.fb_width)
+			w = sc->vtgpu_fb_info.fb_width;
+		if (h > sc->vtgpu_fb_info.fb_height)
+			h = sc->vtgpu_fb_info.fb_height;
+	}
 
-	error = vtgpu_set_scanout(sc, 0, 0, w, h);
+	error = vtgpu_set_scanout_id(sc, rid, 0, 0, w, h);
 	if (error != 0)
 		return (error);
-	(void)vtgpu_transfer_to_host_2d(sc, 0, 0, w, h);
-	(void)vtgpu_resource_flush(sc, 0, 0, w, h);
+
+	(void)vtgpu_transfer_to_host_2d_id(sc, rid, 0, 0, w, h, pitch);
+	(void)vtgpu_resource_flush_id(sc, rid, 0, 0, w, h);
+
+	/* Remember active scanout source for the periodic flush. */
+	sc->vtgpu_drm_active_resource_id = rid;
+	sc->vtgpu_drm_active_width = w;
+	sc->vtgpu_drm_active_height = h;
+	sc->vtgpu_drm_active_pitch = pitch;
+	sc->vtgpu_drm_active_bo = (crtc->fb != NULL) ? fb->bo : NULL;
+
+	if (rid != VTGPU_RESOURCE_ID)
+		virtio_drm_flush_arm(sc);
+	else
+		virtio_drm_flush_disarm(sc);
+
 	return (0);
 }
 
@@ -637,8 +835,38 @@ virtio_drm_crtc_destroy(struct drm_crtc *crtc)
 	drm_crtc_cleanup(crtc);
 }
 
+/*
+ * Phase 3.I (page flip): re-target the active scanout when userland
+ * does drmModePageFlip().  Without this, X's swap-buffers stays
+ * blind to us — we keep flushing the original mode_set buffer while
+ * X has rendered into a new one.
+ */
+static int
+virtio_drm_crtc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
+    struct drm_pending_vblank_event *event)
+{
+	struct vtgpu_softc *sc;
+	struct virtio_drm_framebuffer *vfb;
+
+	(void)event;
+	sc = device_get_softc(crtc->dev->dev);
+	vfb = (struct virtio_drm_framebuffer *)fb;
+
+	crtc->fb = fb;
+	sc->vtgpu_drm_active_resource_id = vfb->bo->resource_id;
+	sc->vtgpu_drm_active_width = fb->width;
+	sc->vtgpu_drm_active_height = fb->height;
+	sc->vtgpu_drm_active_pitch = fb->pitches[0];
+	sc->vtgpu_drm_active_bo = vfb->bo;
+
+	(void)vtgpu_set_scanout_id(sc, vfb->bo->resource_id, 0, 0,
+	    fb->width, fb->height);
+	return (0);
+}
+
 static const struct drm_crtc_funcs virtio_drm_crtc_funcs = {
 	.set_config	= drm_crtc_helper_set_config,
+	.page_flip	= virtio_drm_crtc_page_flip,
 	.destroy	= virtio_drm_crtc_destroy,
 };
 
@@ -884,42 +1112,55 @@ virtio_drm_gem_free_object(struct drm_gem_object *gem_obj)
 	struct vtgpu_gem_bo *bo = (struct vtgpu_gem_bo *)gem_obj;
 	struct vtgpu_softc *sc = device_get_softc(gem_obj->dev->dev);
 
+	mtx_lock(&sc->vtgpu_bos_mtx);
+	TAILQ_REMOVE(&sc->vtgpu_bos, bo, link);
+	if (sc->vtgpu_drm_active_bo == bo)
+		sc->vtgpu_drm_active_bo = NULL;
+	mtx_unlock(&sc->vtgpu_bos_mtx);
+
 	virtio_drm_bo_destroy_host_resource(sc, bo);
-	if (bo->vbase != 0)
-		free((void *)bo->vbase, M_DEVBUF);
+
+	if (bo->cdev_pager != NULL) {
+		/* Releasing the pager triggers vm_page_remove on each page;
+		 * we then unwire and free the underlying pages we allocated. */
+		vm_object_deallocate(bo->cdev_pager);
+		bo->cdev_pager = NULL;
+	}
+	if (bo->vbase != 0) {
+		pmap_qremove(bo->vbase, bo->npages);
+		vmem_free(kernel_arena, bo->vbase, bo->size);
+	}
+	if (bo->pages != NULL) {
+		size_t i;
+		for (i = 0; i < bo->npages; i++) {
+			if (bo->pages[i] == NULL)
+				continue;
+			/* Drop the fictitious flag we set so vm_page_free
+			 * doesn't get confused. */
+			bo->pages[i]->flags &= ~PG_FICTITIOUS;
+			bo->pages[i]->oflags |= VPO_UNMANAGED;
+			vm_page_unwire_noq(bo->pages[i]);
+			vm_page_free(bo->pages[i]);
+		}
+		free(bo->pages, M_DEVBUF);
+	}
 	drm_gem_object_release(gem_obj);
 	free(bo, M_DEVBUF);
 }
 
-/* gem_pager_ops: hand back the right page from the contig buffer. */
+/*
+ * gem_pager_ops fault — should never fire.  dumb_create pre-allocates
+ * the cdev_pager and inserts every backing page at create time, so the
+ * VM layer always finds the page without faulting through here.
+ * If something does call us, fail the lookup rather than allocate
+ * shadow pages that would break the shared-memory contract.
+ */
 static int
 virtio_drm_gem_pager_fault(vm_object_t vm_obj, vm_ooffset_t offset,
     int prot, vm_page_t *mres)
 {
-	(void)prot;
-	struct drm_gem_object *gem_obj = vm_obj->handle;
-	struct vtgpu_gem_bo *bo = (struct vtgpu_gem_bo *)gem_obj;
-	vm_page_t page, oldm;
-	vm_paddr_t paddr;
-
-	if (offset >= bo->size)
-		return (VM_PAGER_FAIL);
-
-	paddr = bo->pbase + offset;
-	page = PHYS_TO_VM_PAGE(paddr);
-	if (page == NULL)
-		return (VM_PAGER_FAIL);
-	vm_page_busy_acquire(page, 0);
-
-	oldm = *mres;
-	if (oldm != NULL) {
-		vm_page_replace(page, vm_obj, oldm->pindex, oldm);
-	} else {
-		vm_page_insert(page, vm_obj, OFF_TO_IDX(offset));
-	}
-	page->valid = VM_PAGE_BITS_ALL;
-	*mres = page;
-	return (VM_PAGER_OK);
+	(void)vm_obj; (void)offset; (void)prot; (void)mres;
+	return (VM_PAGER_FAIL);
 }
 
 static int
@@ -950,8 +1191,14 @@ virtio_drm_dumb_create(struct drm_file *file_priv, struct drm_device *ddev,
 	size_t size;
 	int error;
 
-	args->pitch = (args->width * args->bpp + 7) / 8;
-	args->pitch = roundup(args->pitch, 64);
+	/*
+	 * VirtIO-GPU resources have an implicit stride = width * bpp/8.
+	 * If we hand userland a wider (64-byte-aligned) pitch, X will
+	 * write rows at that stride but the host will read them at the
+	 * tighter implicit stride — content lands only in column 0 of
+	 * each scanout row.  Keep the pitch tight.
+	 */
+	args->pitch = args->width * (args->bpp / 8);
 	args->size = (uint64_t)args->pitch * args->height;
 	size = round_page(args->size);
 	if (size == 0)
@@ -959,13 +1206,53 @@ virtio_drm_dumb_create(struct drm_file *file_priv, struct drm_device *ddev,
 
 	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
 	bo->size = size;
-	bo->vbase = (vm_offset_t)contigmalloc(size, M_DEVBUF,
-	    M_WAITOK | M_ZERO, 0, ~0, 4, 0);
-	if (bo->vbase == 0) {
-		free(bo, M_DEVBUF);
-		return (-ENOMEM);
+	bo->npages = atop(size);
+	bo->pages = malloc(sizeof(vm_page_t) * bo->npages, M_DEVBUF,
+	    M_WAITOK | M_ZERO);
+
+	/*
+	 * Allocate physically contiguous, wired, zeroed pages owned by no
+	 * vm_object.  We will hand these to our cdev_pager so that userland
+	 * mmap and our kernel-side bo->vbase share the same physical memory
+	 * (no COW shadow).
+	 */
+	{
+		vm_page_t m;
+		size_t i;
+		int tries = 0;
+
+retry_alloc:
+		m = vm_page_alloc_noobj_contig(VM_ALLOC_WIRED | VM_ALLOC_ZERO,
+		    bo->npages, 0, ~0UL, PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
+		if (m == NULL) {
+			if (tries++ < 3) {
+				vm_page_reclaim_contig(0, bo->npages, 0, ~0UL,
+				    PAGE_SIZE, 0);
+				goto retry_alloc;
+			}
+			free(bo->pages, M_DEVBUF);
+			free(bo, M_DEVBUF);
+			return (-ENOMEM);
+		}
+		for (i = 0; i < bo->npages; i++, m++) {
+			m->valid = VM_PAGE_BITS_ALL;
+			bo->pages[i] = m;
+		}
+		bo->pbase = VM_PAGE_TO_PHYS(bo->pages[0]);
+
+		if (vmem_alloc(kernel_arena, size, M_WAITOK | M_BESTFIT,
+		    &bo->vbase) != 0) {
+			for (i = 0; i < bo->npages; i++) {
+				vm_page_unwire_noq(bo->pages[i]);
+				vm_page_free(bo->pages[i]);
+			}
+			free(bo->pages, M_DEVBUF);
+			free(bo, M_DEVBUF);
+			return (-ENOMEM);
+		}
+		pmap_qenter(bo->vbase, bo->pages, bo->npages);
 	}
-	bo->pbase = pmap_kextract(bo->vbase);
+
 	bo->resource_id = atomic_fetchadd_32(&sc->vtgpu_next_resource_id, 1);
 
 	error = drm_gem_object_init(ddev, &bo->gem_obj, size);
@@ -974,6 +1261,46 @@ virtio_drm_dumb_create(struct drm_file *file_priv, struct drm_device *ddev,
 	error = drm_gem_create_mmap_offset(&bo->gem_obj);
 	if (error != 0)
 		goto err_gem_release;
+
+	/*
+	 * Pre-allocate the cdev_pager keyed by gem_obj and insert all our
+	 * pages into it.  drm_gem_mmap_single() will later call
+	 * cdev_pager_allocate() with the same handle (gem_obj) and get back
+	 * THIS pager (object lookup by handle), so X's mmap is backed by
+	 * the exact same vm_pages we hold via bo->vbase.  Without this,
+	 * cdev_pager_allocate() creates a fresh empty pager per mmap and
+	 * the on-demand fault path produces pages that the VM layer treats
+	 * as private — X's writes never land in our memory.
+	 */
+	bo->cdev_pager = cdev_pager_allocate(&bo->gem_obj, OBJT_MGTDEVICE,
+	    &virtio_drm_gem_pager_ops, size, 0, 0, NULL);
+	if (bo->cdev_pager == NULL) {
+		error = -ENOMEM;
+		goto err_gem_release;
+	}
+	{
+		struct pctrie_iter pages_iter;
+		size_t i;
+
+		vm_page_iter_init(&pages_iter, bo->cdev_pager);
+		VM_OBJECT_WLOCK(bo->cdev_pager);
+		for (i = 0; i < bo->npages; i++) {
+			/*
+			 * cdev_pager pages must be fictitious + managed so
+			 * pmap doesn't try to look them up through normal
+			 * VM_PAGE_TO_PHYS round-trips on every fault.
+			 */
+			bo->pages[i]->oflags &= ~VPO_UNMANAGED;
+			bo->pages[i]->flags |= PG_FICTITIOUS;
+			if (vm_page_iter_insert(bo->pages[i], bo->cdev_pager,
+			    i, &pages_iter) != 0) {
+				VM_OBJECT_WUNLOCK(bo->cdev_pager);
+				error = -EINVAL;
+				goto err_pager;
+			}
+		}
+		VM_OBJECT_WUNLOCK(bo->cdev_pager);
+	}
 
 	error = virtio_drm_bo_create_host_resource(sc, bo,
 	    args->width, args->height);
@@ -985,13 +1312,34 @@ virtio_drm_dumb_create(struct drm_file *file_priv, struct drm_device *ddev,
 		virtio_drm_bo_destroy_host_resource(sc, bo);
 		goto err_gem_release;
 	}
+
+	mtx_lock(&sc->vtgpu_bos_mtx);
+	TAILQ_INSERT_TAIL(&sc->vtgpu_bos, bo, link);
+	mtx_unlock(&sc->vtgpu_bos_mtx);
+
 	drm_gem_object_unreference_unlocked(&bo->gem_obj);
 	return (0);
 
+err_pager:
+	vm_object_deallocate(bo->cdev_pager);
+	bo->cdev_pager = NULL;
 err_gem_release:
 	drm_gem_object_release(&bo->gem_obj);
 err_free_pages:
-	free((void *)bo->vbase, M_DEVBUF);
+	if (bo->vbase != 0) {
+		pmap_qremove(bo->vbase, bo->npages);
+		vmem_free(kernel_arena, bo->vbase, bo->size);
+	}
+	if (bo->pages != NULL) {
+		size_t i;
+		for (i = 0; i < bo->npages; i++) {
+			if (bo->pages[i] != NULL) {
+				vm_page_unwire_noq(bo->pages[i]);
+				vm_page_free(bo->pages[i]);
+			}
+		}
+		free(bo->pages, M_DEVBUF);
+	}
 	free(bo, M_DEVBUF);
 	return (error);
 }
@@ -1063,6 +1411,9 @@ static void
 virtio_drm_drm_lastclose(struct drm_device *ddev)
 {
 	struct vtgpu_softc *sc = device_get_softc(ddev->dev);
+
+	virtio_drm_flush_disarm(sc);
+	sc->vtgpu_drm_active_resource_id = 0;
 
 	if (!sc->vtgpu_have_fb_info && sc->vtgpu_fb_info.fb_vbase != 0) {
 		vt_allocate(&vtgpu_fb_driver, &sc->vtgpu_fb_info);
@@ -1203,7 +1554,8 @@ static const struct drm_ioctl_desc virtio_drm_ioctls[] = {
 };
 
 static struct drm_driver virtio_drm_drm_driver = {
-	.driver_features	= DRIVER_MODESET | DRIVER_GEM,
+	.driver_features	= DRIVER_MODESET | DRIVER_GEM | DRIVER_PRIME |
+				  DRIVER_RENDER,
 	.load			= virtio_drm_drm_load,
 	.unload			= virtio_drm_drm_unload,
 	.firstopen		= virtio_drm_drm_firstopen,
@@ -1281,6 +1633,10 @@ vtgpu_attach(device_t dev)
 	sc->vtgpu_dev = dev;
 	sc->vtgpu_next_fence = 1;
 	sc->vtgpu_next_resource_id = 3;	/* 1=primary fb, 2=cursor */
+	callout_init(&sc->vtgpu_drm_flush_callout, 1);
+	sx_init(&sc->vtgpu_ctrl_sx, "vtgpu_ctrl_sx");
+	TAILQ_INIT(&sc->vtgpu_bos);
+	mtx_init(&sc->vtgpu_bos_mtx, "vtgpu_bos", NULL, MTX_DEF);
 	virtio_set_feature_desc(dev, vtgpu_feature_desc);
 
 	error = vtgpu_setup_features(sc);
@@ -1433,6 +1789,8 @@ vtgpu_detach(device_t dev)
 	struct vtgpu_softc *sc;
 
 	sc = device_get_softc(dev);
+
+	virtio_drm_flush_disarm(sc);
 
 	/*
 	 * Phase 3.B: unregister DRM device first so userland clients
@@ -1622,31 +1980,34 @@ vtgpu_req_resp(struct vtgpu_softc *sc, void *req, size_t reqlen,
 	struct sglist_seg segs[2];
 	int error;
 
+	sx_xlock(&sc->vtgpu_ctrl_sx);
 	sglist_init(&sg, 2, segs);
 
 	error = sglist_append(&sg, req, reqlen);
 	if (error != 0) {
 		device_printf(sc->vtgpu_dev,
 		    "Unable to append the request to the sglist: %d\n", error);
-		return (error);
+		goto out;
 	}
 	error = sglist_append(&sg, resp, resplen);
 	if (error != 0) {
 		device_printf(sc->vtgpu_dev,
 		    "Unable to append the response buffer to the sglist: %d\n",
 		    error);
-		return (error);
+		goto out;
 	}
 	error = virtqueue_enqueue(sc->vtgpu_ctrl_vq, resp, &sg, 1, 1);
 	if (error != 0) {
 		device_printf(sc->vtgpu_dev, "Enqueue failed: %d\n", error);
-		return (error);
+		goto out;
 	}
 
 	virtqueue_notify(sc->vtgpu_ctrl_vq);
 	virtqueue_poll(sc->vtgpu_ctrl_vq, NULL);
-
-	return (0);
+	error = 0;
+out:
+	sx_xunlock(&sc->vtgpu_ctrl_sx);
+	return (error);
 }
 
 /*
@@ -2204,7 +2565,171 @@ vtgpu_sysctl_cursor_test(SYSCTL_HANDLER_ARGS)
 	    sc->vtgpu_cursor_x, sc->vtgpu_cursor_y, 0, 0));
 }
 
-/* Register the cursor sysctls under the device's auto-created tree. */
+/*
+ * Phase 3.K — diagnostic sysctls.
+ *
+ *   dev.vgpu.<n>.drm_active     : "resource=N width=W height=H pitch=P flush=on/off"
+ *   dev.vgpu.<n>.drm_force_flush=1: force a single TRANSFER_TO_HOST_2D + RESOURCE_FLUSH
+ *                                   on the active scanout resource (for manual debug).
+ */
+static int
+vtgpu_sysctl_drm_active(SYSCTL_HANDLER_ARGS)
+{
+	struct vtgpu_softc *sc = arg1;
+	char buf[96];
+
+	snprintf(buf, sizeof(buf),
+	    "resource=%u width=%u height=%u pitch=%u flush=%s",
+	    sc->vtgpu_drm_active_resource_id, sc->vtgpu_drm_active_width,
+	    sc->vtgpu_drm_active_height, sc->vtgpu_drm_active_pitch,
+	    sc->vtgpu_drm_flush_armed ? "on" : "off");
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+/*
+ * Sweep every registered bo, invalidate cache, look for any
+ * non-zero pixels.  Produces a one-line-per-bo report including
+ * a "nonzero_count" of how many of the first 16384 pixels are
+ * non-zero — non-zero means *somebody* (X, anyone) is drawing to
+ * that buffer.
+ */
+static int
+vtgpu_sysctl_drm_dumpall(SYSCTL_HANDLER_ARGS)
+{
+	struct vtgpu_softc *sc = arg1;
+	struct sbuf sb;
+	struct vtgpu_gem_bo *bo;
+	int error;
+
+	sbuf_new_for_sysctl(&sb, NULL, 4096, req);
+	mtx_lock(&sc->vtgpu_bos_mtx);
+	TAILQ_FOREACH(bo, &sc->vtgpu_bos, link) {
+		size_t nsample = 16384;	/* pixels */
+		size_t nz = 0;
+		uint32_t *px = (uint32_t *)bo->vbase;
+		size_t i;
+
+		if (bo->size / 4 < nsample)
+			nsample = bo->size / 4;
+		cpu_dcache_inv_range((void *)bo->vbase, nsample * 4);
+		for (i = 0; i < nsample; i++)
+			if (px[i] != 0)
+				nz++;
+		sbuf_printf(&sb,
+		    "rid=%u size=%zu px[0]=%08x px[1]=%08x nonzero=%zu/%zu%s\n",
+		    bo->resource_id, bo->size, px[0], px[1], nz, nsample,
+		    (bo == sc->vtgpu_drm_active_bo) ? " [ACTIVE]" : "");
+	}
+	mtx_unlock(&sc->vtgpu_bos_mtx);
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+
+/*
+ * Read: print first 8 pixels of the active bo as hex so we can tell
+ * whether X actually wrote anything visible.  Write 1: do a dcache
+ * inv (so stale-in-cache writebacks aren't dropped) before reading.
+ */
+static int
+vtgpu_sysctl_drm_peek(SYSCTL_HANDLER_ARGS)
+{
+	struct vtgpu_softc *sc = arg1;
+	struct vtgpu_gem_bo *bo = sc->vtgpu_drm_active_bo;
+	char buf[160];
+	int n = 0;
+
+	if (bo == NULL || bo->vbase == 0) {
+		snprintf(buf, sizeof(buf), "no active bo");
+		return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+	}
+	cpu_dcache_inv_range((void *)bo->vbase, 64);
+	uint32_t *px = (uint32_t *)bo->vbase;
+	n = snprintf(buf, sizeof(buf),
+	    "rid=%u size=%zu px[0..7]=%08x %08x %08x %08x %08x %08x %08x %08x",
+	    sc->vtgpu_drm_active_resource_id, bo->size,
+	    px[0], px[1], px[2], px[3], px[4], px[5], px[6], px[7]);
+	(void)n;
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+/*
+ * Fill the active scanout resource's backing memory with a known
+ * pattern (write 1 = red, 2 = green, 3 = blue) and push it.  Tests
+ * the transfer-and-flush pipeline end-to-end without depending on X.
+ */
+static int
+vtgpu_sysctl_drm_test_fill(SYSCTL_HANDLER_ARGS)
+{
+	struct vtgpu_softc *sc = arg1;
+	struct vtgpu_gem_bo *bo;
+	int val = 0, error;
+	uint32_t color;
+	size_t i, npixels;
+	uint32_t *px;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL || val == 0)
+		return (error);
+
+	bo = sc->vtgpu_drm_active_bo;
+	if (bo == NULL || bo->vbase == 0) {
+		device_printf(sc->vtgpu_dev,
+		    "drm_test_fill: no active bo\n");
+		return (0);
+	}
+
+	switch (val) {
+	case 1: color = 0xFF0000FF; break;	/* red    BGRA */
+	case 2: color = 0xFF00FF00; break;	/* green  BGRA */
+	case 3: color = 0xFFFF0000; break;	/* blue   BGRA */
+	default: color = 0xFFFFFFFF;
+	}
+
+	npixels = bo->size / 4;
+	px = (uint32_t *)bo->vbase;
+	for (i = 0; i < npixels; i++)
+		px[i] = color;
+
+	(void)vtgpu_transfer_to_host_2d_id(sc, sc->vtgpu_drm_active_resource_id,
+	    0, 0, sc->vtgpu_drm_active_width, sc->vtgpu_drm_active_height,
+	    sc->vtgpu_drm_active_pitch);
+	(void)vtgpu_resource_flush_id(sc, sc->vtgpu_drm_active_resource_id,
+	    0, 0, sc->vtgpu_drm_active_width, sc->vtgpu_drm_active_height);
+
+	device_printf(sc->vtgpu_dev,
+	    "drm_test_fill: filled bo rid=%u with 0x%08x, flushed\n",
+	    sc->vtgpu_drm_active_resource_id, color);
+	return (0);
+}
+
+static int
+vtgpu_sysctl_drm_force_flush(SYSCTL_HANDLER_ARGS)
+{
+	struct vtgpu_softc *sc = arg1;
+	int val = 0, error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL || val == 0)
+		return (error);
+	if (sc->vtgpu_drm_active_resource_id == 0) {
+		device_printf(sc->vtgpu_dev,
+		    "drm_force_flush: no active scanout resource\n");
+		return (0);
+	}
+	(void)vtgpu_transfer_to_host_2d_id(sc, sc->vtgpu_drm_active_resource_id,
+	    0, 0, sc->vtgpu_drm_active_width, sc->vtgpu_drm_active_height,
+	    sc->vtgpu_drm_active_pitch);
+	(void)vtgpu_resource_flush_id(sc, sc->vtgpu_drm_active_resource_id,
+	    0, 0, sc->vtgpu_drm_active_width, sc->vtgpu_drm_active_height);
+	device_printf(sc->vtgpu_dev,
+	    "drm_force_flush: pushed rid=%u %ux%u (pitch=%u)\n",
+	    sc->vtgpu_drm_active_resource_id, sc->vtgpu_drm_active_width,
+	    sc->vtgpu_drm_active_height, sc->vtgpu_drm_active_pitch);
+	return (0);
+}
+
+/* Register the cursor + DRM debug sysctls under the auto-created tree. */
 static void
 vtgpu_sysctl_setup(struct vtgpu_softc *sc)
 {
@@ -2217,9 +2742,34 @@ vtgpu_sysctl_setup(struct vtgpu_softc *sc)
 	    CTLTYPE_STRING | CTLFLAG_RW, sc, 0, vtgpu_sysctl_cursor_xy, "A",
 	    "Cursor X Y position; write to issue MOVE_CURSOR");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
-	    "cursor_test_pattern", CTLTYPE_INT | CTLFLAG_WR, sc, 0,
+	    "cursor_test_pattern", CTLTYPE_INT | CTLFLAG_RW, sc, 0,
 	    vtgpu_sysctl_cursor_test, "I",
 	    "Write 1 to install a magenta test bitmap + UPDATE_CURSOR");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO, "drm_active",
+	    CTLTYPE_STRING | CTLFLAG_RD, sc, 0, vtgpu_sysctl_drm_active, "A",
+	    "DRM-KMS active scanout resource state");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
+	    "drm_force_flush", CTLTYPE_INT | CTLFLAG_RW, sc, 0,
+	    vtgpu_sysctl_drm_force_flush, "I",
+	    "Write 1 to force a transfer+flush on the active scanout");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
+	    "drm_test_fill", CTLTYPE_INT | CTLFLAG_RW, sc, 0,
+	    vtgpu_sysctl_drm_test_fill, "I",
+	    "Write 1=red 2=green 3=blue to fill the active bo and flush");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
+	    "drm_peek", CTLTYPE_STRING | CTLFLAG_RD, sc, 0,
+	    vtgpu_sysctl_drm_peek, "A",
+	    "Show first 8 pixels of the active bo");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
+	    "drm_dumpall", CTLTYPE_STRING | CTLFLAG_RD, sc, 0,
+	    vtgpu_sysctl_drm_dumpall, "A",
+	    "Scan every dumb bo for non-zero pixels");
+	SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
+	    "drm_dirty_calls", CTLFLAG_RD, &sc->vtgpu_drm_dirty_calls, 0,
+	    "Number of times .dirty has been called by userland");
+	SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
+	    "drm_dirty_rects", CTLFLAG_RD, &sc->vtgpu_drm_dirty_rects, 0,
+	    "Total clip rects across all .dirty calls");
 }
 
 static int
@@ -2333,5 +2883,102 @@ vtgpu_resource_flush(struct vtgpu_softc *sc, uint32_t x, uint32_t y,
 		return (EINVAL);
 	}
 
+	return (0);
+}
+
+/*
+ * 3.I — resource-id-aware variants used by the DRM-KMS path so it can
+ * point the scanout at userland's dumb buffers (resource_id >= 3)
+ * instead of always reusing the attach-time fb (resource_id == 1).
+ */
+static int
+vtgpu_set_scanout_id(struct vtgpu_softc *sc, uint32_t resource_id,
+    uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+{
+	struct {
+		struct virtio_gpu_set_scanout req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_SET_SCANOUT);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.r.x = htole32(x);
+	s.req.r.y = htole32(y);
+	s.req.r.width = htole32(width);
+	s.req.r.height = htole32(height);
+	s.req.scanout_id = htole32(sc->vtgpu_primary_scanout);
+	s.req.resource_id = htole32(resource_id);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (EINVAL);
+	return (0);
+}
+
+static int
+vtgpu_transfer_to_host_2d_id(struct vtgpu_softc *sc, uint32_t resource_id,
+    uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t pitch)
+{
+	struct {
+		struct virtio_gpu_transfer_to_host_2d req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.r.x = htole32(x);
+	s.req.r.y = htole32(y);
+	s.req.r.width = htole32(width);
+	s.req.r.height = htole32(height);
+	s.req.offset = htole64((uint64_t)y * pitch + (uint64_t)x * 4);
+	s.req.resource_id = htole32(resource_id);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (EINVAL);
+	return (0);
+}
+
+static int
+vtgpu_resource_flush_id(struct vtgpu_softc *sc, uint32_t resource_id,
+    uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+{
+	struct {
+		struct virtio_gpu_resource_flush req;
+		char pad;
+		struct virtio_gpu_ctrl_hdr resp;
+	} s = { 0 };
+	int error;
+
+	s.req.hdr.type = htole32(VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+	s.req.hdr.flags = htole32(VIRTIO_GPU_FLAG_FENCE);
+	s.req.hdr.fence_id = htole64(
+	    atomic_fetchadd_64(&sc->vtgpu_next_fence, 1));
+	s.req.r.x = htole32(x);
+	s.req.r.y = htole32(y);
+	s.req.r.width = htole32(width);
+	s.req.r.height = htole32(height);
+	s.req.resource_id = htole32(resource_id);
+
+	error = vtgpu_req_resp(sc, &s.req, sizeof(s.req), &s.resp,
+	    sizeof(s.resp));
+	if (error != 0)
+		return (error);
+	if (s.resp.type != htole32(VIRTIO_GPU_RESP_OK_NODATA))
+		return (EINVAL);
 	return (0);
 }
