@@ -931,20 +931,26 @@ virtio_drm_connector_get_modes(struct drm_connector *connector)
 		drm_mode_connector_update_edid_property(connector, edid);
 		count = drm_add_edid_modes(connector, edid);
 	}
-	if (count == 0) {
+	{
 		/*
-		 * Host didn't give us a usable EDID — fall back to the
-		 * advertised scanout dimensions so userland sees at least
-		 * one mode.
+		 * QEMU's synthesized EDID typically lists only the
+		 * configured xres/yres.  Supplement with the standard
+		 * CEA/VESA mode table so userland (xrandr, xfce display
+		 * settings) has the usual list of selectable resolutions
+		 * up to the host's max scanout size.
 		 */
-		struct drm_display_mode *mode;
 		uint32_t w = sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].width;
 		uint32_t h = sc->vtgpu_scanouts[sc->vtgpu_primary_scanout].height;
 		if (w == 0 || h == 0) { w = 1024; h = 768; }
-		mode = drm_cvt_mode(connector->dev, w, h, 60, false, false, false);
-		if (mode != NULL) {
-			drm_mode_probed_add(connector, mode);
-			count = 1;
+		count += drm_add_modes_noedid(connector, w, h);
+		if (count == 0) {
+			struct drm_display_mode *mode;
+			mode = drm_cvt_mode(connector->dev, w, h, 60,
+			    false, false, false);
+			if (mode != NULL) {
+				drm_mode_probed_add(connector, mode);
+				count = 1;
+			}
 		}
 	}
 	return (count);
@@ -1893,6 +1899,11 @@ vtgpu_config_change(device_t dev)
 						(void)vtgpu_get_edid(sc, i);
 				}
 			}
+			/* Tell DRM userland (X RandR, modesetting) to
+			 * re-probe the connector so the new host display
+			 * size becomes a selectable mode. */
+			if (sc->vtgpu_drm_dev != NULL)
+				drm_kms_helper_hotplug_event(sc->vtgpu_drm_dev);
 		}
 		cleared |= VIRTIO_GPU_EVENT_DISPLAY;
 	}
