@@ -1815,6 +1815,21 @@ static const struct drm_ioctl_desc virtio_drm_ioctls[] = {
 	/* per-driver ioctls land here in later phases */
 };
 
+/*
+ * Compat shim: DRIVER_RENDER (DRI3 render-node opt-in) is wired into drm2
+ * by the not-yet-upstream "drm2: wire up PRIME (DRI3) + render node" patch
+ * (PR #2220).  On a stock FreeBSD-15.0-RELEASE tree only DRIVER_PRIME is
+ * defined.  Fall back to 0 so virtio_drm builds against both -- on a
+ * stock tree the driver still attaches and provides basic KMS scanout;
+ * the render node (/dev/dri/renderD<n>) just isn't created.
+ */
+#ifndef DRIVER_RENDER
+#define DRIVER_RENDER 0
+#endif
+#ifndef DRIVER_PRIME
+#define DRIVER_PRIME 0
+#endif
+
 static struct drm_driver virtio_drm_drm_driver = {
 	.driver_features	= DRIVER_MODESET | DRIVER_GEM | DRIVER_PRIME |
 				  DRIVER_RENDER,
